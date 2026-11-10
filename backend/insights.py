@@ -255,11 +255,16 @@ def build_insights(visits: list[Assessed], profiles: dict, weight_history: dict,
                 detail += (f" {cat} is above that range but steady, and a change from {poss} own normal matters more "
                            "than the textbook number.")
             detail += gi_note
+            why = ("A change from a cat's own normal matters more than the exact number. Peeing more can go with "
+                   "drinking more (kidney or thyroid issues, diabetes) or bladder irritation. Frequent trips with "
+                   "little coming out can mean a blockage, which is an emergency.")
+            if pron == "he":
+                why += (f" {cat} is male. Males have a narrower urethra and are much more likely to get blocked, "
+                        "so repeated trips with little output, straining, or crying in the box means going to a vet "
+                        "or emergency clinic right away, not waiting.")
             findings.append({
                 "id": "urine", "topic": "Peeing", "level": lvl, "title": title, "detail": detail,
-                "why": ("A change from a cat's own normal matters more than the exact number. Peeing more can go with "
-                        "drinking more (kidney or thyroid issues, diabetes) or bladder irritation. Frequent trips with "
-                        "little coming out can mean a blockage, which is an emergency."),
+                "why": why,
                 "action": action, "sources": ["pee", "baseline", "straining"],
             })
 

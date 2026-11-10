@@ -47,6 +47,34 @@ async def build_pet_map(account):
         print(f"[PET MAP] {e}")
 
 
+async def cache_whisker_photos(db):
+    """Keep a local copy of each Whisker profile photo. Whisker's links expire within
+    an hour and carry temporary AWS keys, so the dashboard serves its own copy instead.
+    A photo uploaded from the dashboard always wins."""
+    import httpx
+    for prof in db.query(PetProfile).all():
+        if not prof.whisker_image_url or (prof.photo_file and not prof.photo_file.endswith("_whisker.jpg")):
+            continue
+        name = f"{prof.cat.lower()}_whisker.jpg"
+        path = os.path.join(PHOTO_DIR, name)
+        fresh = os.path.exists(path) and (utc_now() - datetime.utcfromtimestamp(os.path.getmtime(path))).days < 7
+        if fresh and prof.photo_file == name:
+            continue
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                r = await client.get(prof.whisker_image_url)
+            if r.status_code != 200:
+                continue
+            from PIL import Image, ImageOps
+            img = ImageOps.exif_transpose(Image.open(io.BytesIO(r.content))).convert("RGB")
+            img.thumbnail((900, 900))
+            img.save(path, "JPEG", quality=86)
+            prof.photo_file, prof.photo_updated = name, utc_now()
+            db.commit()
+        except Exception as e:
+            print(f"[PHOTO] {prof.cat}: {e}")
+
+
 def save_pet_profiles(db, account):
     """Mirror photo, details, and weight history from the Whisker pet profile."""
     for pet in getattr(account, "pets", None) or []:
@@ -123,6 +151,7 @@ async def sync_litter_robot(historical: bool = False):
             await account.connect(username=email, password=password, load_robots=True, load_pets=True)
             await build_pet_map(account)
             save_pet_profiles(db, account)
+            await cache_whisker_photos(db)
 
             limit = 1000 if historical else 200
             new_count = pet_visits = 0
@@ -490,11 +519,11 @@ def _profiles(db) -> dict:
         if p.photo_file and os.path.exists(os.path.join(PHOTO_DIR, p.photo_file)):
             v = int(p.photo_updated.timestamp()) if p.photo_updated else 0
             photo = f"/api/pets/{p.cat}/photo?v={v}"
-        out[p.cat] = {"cat": p.cat, "photo": photo, "whisker_photo": p.whisker_image_url,
+        out[p.cat] = {"cat": p.cat, "photo": photo, "photo_source": ("whisker" if (p.photo_file or "").endswith("_whisker.jpg") else "upload") if photo else None,
                       "gender": p.gender, "birthday": p.birthday, "age": p.age, "breeds": p.breeds,
                       "diet": p.diet, "is_fixed": p.is_fixed}
     for c in CATS:
-        out.setdefault(c, {"cat": c, "photo": None, "whisker_photo": None})
+        out.setdefault(c, {"cat": c, "photo": None})
     return out
 
 
