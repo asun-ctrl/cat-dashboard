@@ -65,6 +65,7 @@ FLAG_TEXT = {
     "weight_outlier": "Weight outside this cat's normal range",
     "matches_other_cat": "Weight matches the other cat, likely mislabeled",
     "inferred_by_weight": "Untagged, but weight matches this cat",
+    "no_weight_match": "Weight doesn't match either cat (likely a partial step)",
     "brief_visit": "Very short visit",
     "waste_missing": "No waste weight",
     "waste_outlier": "Waste weight outside normal range",
@@ -183,6 +184,8 @@ def assess(rows: Iterable, overrides: Optional[dict] = None) -> list[Assessed]:
                 if len(matches) == 1:
                     v.likely_cat = matches[0]
                     v.flags.append("inferred_by_weight")
+                elif not matches:
+                    v.flags.append("no_weight_match")
 
         # Duration
         if v.duration is not None and v.duration > 0:

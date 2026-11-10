@@ -1,6 +1,7 @@
 import asyncio
 import csv
 import io
+import json
 import os
 from datetime import datetime, timedelta, timezone
 from statistics import median
@@ -8,16 +9,17 @@ from typing import Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 load_dotenv()
 
 import alerts as alerting  # noqa: E402
-from db import (AlertLog, LitterVisit, RobotStatus, SessionLocal, SyncLog,  # noqa: E402
-                VisitOverride, init_db, DATA_DIR)
+from db import (AlertLog, LitterVisit, Observation, PetProfile, RobotStatus,  # noqa: E402
+                SessionLocal, SyncLog, VisitOverride, WeightHistory, init_db, DATA_DIR)
+from insights import build_insights, possible_loose_stool  # noqa: E402
 from quality import CATS, FLAG_TEXT, assess, quality_report  # noqa: E402
 from timeutil import (days_back, iso_utc, local_date, local_midnight_utc,  # noqa: E402
                       to_local, utc_now)
@@ -43,6 +45,38 @@ async def build_pet_map(account):
                 PET_ID_MAP[pid] = name
     except Exception as e:
         print(f"[PET MAP] {e}")
+
+
+def save_pet_profiles(db, account):
+    """Mirror photo, details, and weight history from the Whisker pet profile."""
+    for pet in getattr(account, "pets", None) or []:
+        try:
+            data = getattr(pet, "_data", {}) or {}
+            name = data.get("name") or getattr(pet, "name", None)
+            if name not in CATS:
+                continue
+            prof = db.get(PetProfile, name) or PetProfile(cat=name)
+            prof.pet_id = data.get("petId")
+            prof.whisker_image_url = data.get("s3ImageURL")
+            prof.gender = data.get("gender")
+            prof.birthday = data.get("birthday")
+            prof.age = data.get("age")
+            prof.breeds = ", ".join(data.get("breeds") or []) or None
+            prof.diet = data.get("diet")
+            prof.is_fixed = 1 if data.get("isFixed") else 0 if data.get("isFixed") is not None else None
+            prof.updated_at = utc_now()
+            db.add(prof)
+            for entry in data.get("weightHistory") or []:
+                ts = parse_ts(entry.get("timestamp"))
+                w = entry.get("weight")
+                if ts is None or not w:
+                    continue
+                if not db.query(WeightHistory.id).filter(WeightHistory.cat == name, WeightHistory.timestamp == ts).first():
+                    db.add(WeightHistory(cat=name, timestamp=ts, weight_lbs=float(w)))
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            print(f"[PROFILE] {e}")
 
 
 def get_cat_name(ad):
@@ -88,6 +122,7 @@ async def sync_litter_robot(historical: bool = False):
             account = Account(robot_types=[LitterRobot5])
             await account.connect(username=email, password=password, load_robots=True)
             await build_pet_map(account)
+            save_pet_profiles(db, account)
 
             limit = 1000 if historical else 200
             new_count = pet_visits = 0
@@ -113,9 +148,13 @@ async def sync_litter_robot(historical: bool = False):
                     if ts is None:
                         continue
                     cat, pid = get_cat_name(ad)
-                    exists = db.query(LitterVisit.id).filter(
+                    event_id = ad.get("eventId") or ad.get("id")
+                    exists = db.query(LitterVisit).filter(
                         LitterVisit.timestamp == ts, LitterVisit.cat_name == cat).first()
                     if exists:
+                        if exists.raw_json is None:
+                            exists.event_id = str(event_id) if event_id else None
+                            exists.raw_json = json.dumps(ad, default=str)
                         continue
                     db.add(LitterVisit(
                         cat_name=cat, pet_id=pid, timestamp=ts,
@@ -123,6 +162,8 @@ async def sync_litter_robot(historical: bool = False):
                         duration_seconds=ad.get("duration"),
                         weight_grams=ad.get("petWeight"),
                         waste_weight_grams=ad.get("wasteWeight"),
+                        event_id=str(event_id) if event_id else None,
+                        raw_json=json.dumps(ad, default=str),
                     ))
                     new_count += 1
             db.commit()
@@ -290,8 +331,9 @@ def build_summary(visits, now: Optional[datetime] = None) -> dict:
     return results
 
 
-def visit_json(v):
+def visit_json(v, loose=frozenset()):
     return {
+        "possible_loose_stool": v.id in loose,
         "id": v.id, "cat_name": v.cat or ("Unknown" if v.reported_cat not in CATS else v.reported_cat),
         "reported_cat": v.reported_cat, "counted_as": v.cat, "likely_cat": v.likely_cat,
         "timestamp": iso_utc(v.ts), "waste_type": v.waste_type, "duration_seconds": v.duration,
@@ -334,7 +376,10 @@ def get_recent_visits(limit: int = 50, flagged_only: bool = False):
         if flagged_only:
             vs = [v for v in vs if not v.counted or v.cat is None or not v.use_weight
                   or "waste_outlier" in v.flags or v.override]
-        return [visit_json(v) for v in vs[:max(1, min(limit, 500))]]
+        loose = set()
+        for c in CATS:
+            loose |= possible_loose_stool(vs, c)
+        return [visit_json(v, loose) for v in vs[:max(1, min(limit, 500))]]
     finally:
         db.close()
 
@@ -432,6 +477,160 @@ def export_csv():
         buf.seek(0)
         return StreamingResponse(iter([buf.getvalue()]), media_type="text/csv",
                                  headers={"Content-Disposition": "attachment; filename=litter_visits.csv"})
+    finally:
+        db.close()
+
+
+# ── Insights, profiles, photos, check-ins ───────────────────────────────────
+
+def _profiles(db) -> dict:
+    out = {}
+    for p in db.query(PetProfile).all():
+        photo = None
+        if p.photo_file and os.path.exists(os.path.join(PHOTO_DIR, p.photo_file)):
+            v = int(p.photo_updated.timestamp()) if p.photo_updated else 0
+            photo = f"/api/pets/{p.cat}/photo?v={v}"
+        out[p.cat] = {"cat": p.cat, "photo": photo, "whisker_photo": p.whisker_image_url,
+                      "gender": p.gender, "birthday": p.birthday, "age": p.age, "breeds": p.breeds,
+                      "diet": p.diet, "is_fixed": p.is_fixed}
+    for c in CATS:
+        out.setdefault(c, {"cat": c, "photo": None, "whisker_photo": None})
+    return out
+
+
+def _weight_history(db, days: int = 400) -> dict:
+    since = utc_now() - timedelta(days=days)
+    out = {}
+    for w in db.query(WeightHistory).filter(WeightHistory.timestamp >= since).all():
+        out.setdefault(w.cat, []).append((w.timestamp, w.weight_lbs))
+    return out
+
+
+@app.get("/api/insights")
+def get_insights():
+    db = SessionLocal()
+    try:
+        visits = load_assessed(db, days=120)
+        obs = db.query(Observation).filter(Observation.created_at >= utc_now() - timedelta(days=60)).all()
+        return build_insights(visits, _profiles(db), _weight_history(db), obs)
+    finally:
+        db.close()
+
+
+@app.get("/api/pets")
+def get_pets():
+    db = SessionLocal()
+    try:
+        return _profiles(db)
+    finally:
+        db.close()
+
+
+PHOTO_DIR = os.path.join(DATA_DIR, "photos")
+os.makedirs(PHOTO_DIR, exist_ok=True)
+
+
+@app.post("/api/pets/{cat}/photo")
+async def upload_photo(cat: str, file: UploadFile = File(...)):
+    if cat not in CATS:
+        raise HTTPException(404, "Unknown cat")
+    data = await file.read()
+    if len(data) > 15 * 1024 * 1024:
+        raise HTTPException(413, "Photo is too large (15 MB max)")
+    try:
+        from PIL import Image, ImageOps
+        try:
+            from pillow_heif import register_heif_opener
+            register_heif_opener()
+        except ImportError:
+            pass
+        img = ImageOps.exif_transpose(Image.open(io.BytesIO(data))).convert("RGB")
+        img.thumbnail((900, 900))
+    except Exception:
+        raise HTTPException(400, "That file isn't a photo we can read. Try a JPG, PNG, or HEIC.")
+    name = f"{cat.lower()}.jpg"
+    img.save(os.path.join(PHOTO_DIR, name), "JPEG", quality=86)  # re-encoding drops EXIF, including location
+    db = SessionLocal()
+    try:
+        prof = db.get(PetProfile, cat) or PetProfile(cat=cat)
+        prof.photo_file, prof.photo_updated = name, utc_now()
+        db.add(prof)
+        db.commit()
+    finally:
+        db.close()
+    return {"ok": True}
+
+
+@app.get("/api/pets/{cat}/photo")
+def get_photo(cat: str):
+    db = SessionLocal()
+    try:
+        prof = db.get(PetProfile, cat)
+        if not prof or not prof.photo_file:
+            raise HTTPException(404, "No photo")
+        path = os.path.join(PHOTO_DIR, prof.photo_file)
+        if not os.path.exists(path):
+            raise HTTPException(404, "No photo")
+        return FileResponse(path, media_type="image/jpeg", headers={"Cache-Control": "public, max-age=86400"})
+    finally:
+        db.close()
+
+
+OBS_KINDS = {"normal_stool", "soft_stool", "diarrhea", "blood", "constipated", "vomit", "hairball", "note"}
+
+
+class ObservationIn(BaseModel):
+    cat: str
+    kind: str
+    visit_id: Optional[int] = None
+    note: Optional[str] = None
+
+
+@app.get("/api/observations")
+def list_observations(days: int = 30):
+    db = SessionLocal()
+    try:
+        rows = db.query(Observation).filter(Observation.created_at >= utc_now() - timedelta(days=days)) \
+            .order_by(Observation.created_at.desc()).all()
+        return [{"id": o.id, "cat": o.cat, "kind": o.kind, "visit_id": o.visit_id, "note": o.note,
+                 "created_at": iso_utc(o.created_at)} for o in rows]
+    finally:
+        db.close()
+
+
+@app.post("/api/observations")
+def add_observation(body: ObservationIn):
+    if body.cat not in CATS or body.kind not in OBS_KINDS:
+        raise HTTPException(400, "Unknown cat or observation type")
+    db = SessionLocal()
+    try:
+        o = Observation(cat=body.cat, kind=body.kind, visit_id=body.visit_id,
+                        note=(body.note or "")[:500] or None, created_at=utc_now())
+        db.add(o)
+        db.commit()
+        return {"ok": True, "id": o.id}
+    finally:
+        db.close()
+
+
+@app.delete("/api/observations/{obs_id}")
+def delete_observation(obs_id: int):
+    db = SessionLocal()
+    try:
+        db.query(Observation).filter(Observation.id == obs_id).delete()
+        db.commit()
+        return {"ok": True}
+    finally:
+        db.close()
+
+
+@app.get("/api/debug/activity-keys")
+def activity_keys():
+    """Field names (not values) of the newest stored Whisker activity."""
+    db = SessionLocal()
+    try:
+        v = db.query(LitterVisit).filter(LitterVisit.raw_json.isnot(None)).order_by(LitterVisit.timestamp.desc()).first()
+        return {"keys": sorted(json.loads(v.raw_json).keys()) if v else [], "has_event_id": bool(v and v.event_id)}
     finally:
         db.close()
 

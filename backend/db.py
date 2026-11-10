@@ -29,6 +29,8 @@ class LitterVisit(Base):
     duration_seconds = Column(Integer, nullable=True)
     weight_grams = Column(Float, nullable=True)  # legacy name: raw Whisker petWeight (hundredths of a lb)
     waste_weight_grams = Column(Float, nullable=True)  # raw Whisker wasteWeight
+    event_id = Column(String, nullable=True)     # Whisker eventId, needed to send corrections back
+    raw_json = Column(Text, nullable=True)       # full activity record, kept for future features
 
     __table_args__ = (UniqueConstraint("timestamp", "cat_name", name="uq_visit_ts_cat"),)
 
@@ -42,6 +44,44 @@ class VisitOverride(Base):
     assign_to = Column(String, nullable=True)
     note = Column(String, nullable=True)
     created_at = Column(DateTime)
+
+
+class PetProfile(Base):
+    """Per-cat profile: photo and details mirrored from Whisker."""
+    __tablename__ = "pet_profiles"
+    cat = Column(String, primary_key=True)
+    pet_id = Column(String, nullable=True)
+    photo_file = Column(String, nullable=True)        # uploaded photo filename under DATA_DIR/photos
+    photo_updated = Column(DateTime, nullable=True)
+    whisker_image_url = Column(Text, nullable=True)
+    gender = Column(String, nullable=True)
+    birthday = Column(String, nullable=True)
+    age = Column(Integer, nullable=True)
+    breeds = Column(String, nullable=True)
+    diet = Column(String, nullable=True)
+    is_fixed = Column(Integer, nullable=True)
+    updated_at = Column(DateTime, nullable=True)
+
+
+class WeightHistory(Base):
+    """Weight readings from the Whisker pet profile (can predate stored visits)."""
+    __tablename__ = "weight_history"
+    id = Column(Integer, primary_key=True)
+    cat = Column(String, index=True)
+    timestamp = Column(DateTime, index=True)
+    weight_lbs = Column(Float)
+    __table_args__ = (UniqueConstraint("cat", "timestamp", name="uq_weight_cat_ts"),)
+
+
+class Observation(Base):
+    """Something you saw in the box, logged from the dashboard."""
+    __tablename__ = "observations"
+    id = Column(Integer, primary_key=True)
+    cat = Column(String, index=True)
+    kind = Column(String)          # normal_stool | soft_stool | diarrhea | blood | constipated | vomit | hairball | note
+    visit_id = Column(Integer, nullable=True)
+    note = Column(String, nullable=True)
+    created_at = Column(DateTime, index=True)
 
 
 class RobotStatus(Base):
@@ -78,6 +118,7 @@ def init_db():
     # Lightweight migration for databases created by the old single-file version.
     insp = inspect(engine)
     cols = {c["name"] for c in insp.get_columns("litter_visits")}
-    if "pet_id" not in cols:
-        with engine.begin() as conn:
-            conn.execute(text("ALTER TABLE litter_visits ADD COLUMN pet_id VARCHAR"))
+    with engine.begin() as conn:
+        for name, ddl in (("pet_id", "VARCHAR"), ("event_id", "VARCHAR"), ("raw_json", "TEXT")):
+            if name not in cols:
+                conn.execute(text(f"ALTER TABLE litter_visits ADD COLUMN {name} {ddl}"))
