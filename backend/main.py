@@ -1,393 +1,440 @@
 import asyncio
+import csv
+import io
 import os
-from datetime import datetime, timedelta
-from dotenv import load_dotenv
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+from datetime import datetime, timedelta, timezone
+from statistics import median
+from typing import Optional
+
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime
-from sqlalchemy.orm import declarative_base, sessionmaker
-import uvicorn
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 
 load_dotenv()
 
-DATABASE_URL = "sqlite:///./cat_health.db"
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
-Base = declarative_base()
-SessionLocal = sessionmaker(bind=engine)
+import alerts as alerting  # noqa: E402
+from db import (AlertLog, LitterVisit, RobotStatus, SessionLocal, SyncLog,  # noqa: E402
+                VisitOverride, init_db, DATA_DIR)
+from quality import CATS, FLAG_TEXT, assess, quality_report  # noqa: E402
+from timeutil import (days_back, iso_utc, local_date, local_midnight_utc,  # noqa: E402
+                      to_local, utc_now)
 
-class LitterVisit(Base):
-    __tablename__ = "litter_visits"
-    id = Column(Integer, primary_key=True, index=True)
-    cat_name = Column(String)
-    timestamp = Column(DateTime)
-    waste_type = Column(String)
-    duration_seconds = Column(Integer, nullable=True)
-    weight_grams = Column(Float, nullable=True)
-    waste_weight_grams = Column(Float, nullable=True)
+init_db()
 
-class RobotStatus(Base):
-    __tablename__ = "robot_status"
-    id = Column(Integer, primary_key=True, index=True)
-    timestamp = Column(DateTime)
-    waste_drawer_level = Column(Float, nullable=True)
-    litter_level = Column(String, nullable=True)
-    is_online = Column(Integer, default=1)
+app = FastAPI(title="Cat Health Monitor")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-class SyncLog(Base):
-    __tablename__ = "sync_log"
-    id = Column(Integer, primary_key=True, index=True)
-    timestamp = Column(DateTime)
-    status = Column(String)
-    message = Column(String)
-
-Base.metadata.create_all(bind=engine)
-
-app = FastAPI()
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-PET_ID_MAP = {
-    "PET-4bb19424-5bff-430a-a82d-58121d25838f": "Guava"
-}
+PET_ID_MAP = {"PET-4bb19424-5bff-430a-a82d-58121d25838f": "Guava"}
 LYCHEE_ID_SUFFIX = "2219d03e"
+HISTORY_DAYS = int(os.getenv("HISTORY_DAYS", "400"))
+
+
+# ── Whisker sync ─────────────────────────────────────────────────────────────
 
 async def build_pet_map(account):
     try:
-        if hasattr(account, 'pets') and account.pets:
-            for pet in account.pets:
-                pet_id = getattr(pet, 'id', None) or getattr(pet, 'petId', None)
-                pet_name = getattr(pet, 'name', None)
-                if pet_id and pet_name:
-                    PET_ID_MAP[pet_id] = pet_name
+        for pet in getattr(account, "pets", None) or []:
+            pid = getattr(pet, "id", None) or getattr(pet, "petId", None)
+            name = getattr(pet, "name", None)
+            if pid and name:
+                PET_ID_MAP[pid] = name
     except Exception as e:
         print(f"[PET MAP] {e}")
 
-def get_cat_name(activity_dict):
-    pet_ids = activity_dict.get('petIds', [])
-    if pet_ids:
-        pet_id = pet_ids[0]
-        if pet_id in PET_ID_MAP:
-            return PET_ID_MAP[pet_id]
-        if pet_id.endswith(LYCHEE_ID_SUFFIX):
-            PET_ID_MAP[pet_id] = "Lychee"
-            return "Lychee"
-        return f"Cat-{pet_id[-8:]}"
-    return "Unknown"
 
-async def sync_litter_robot(historical=False):
+def get_cat_name(ad):
+    pet_ids = ad.get("petIds") or []
+    if not pet_ids:
+        return "Unknown", None
+    pid = pet_ids[0]
+    if pid in PET_ID_MAP:
+        return PET_ID_MAP[pid], pid
+    if pid.endswith(LYCHEE_ID_SUFFIX):
+        PET_ID_MAP[pid] = "Lychee"
+        return "Lychee", pid
+    return f"Cat-{pid[-8:]}", pid
+
+
+def parse_ts(value) -> Optional[datetime]:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        try:
+            dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if dt.tzinfo:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+_sync_lock = asyncio.Lock()
+
+
+async def sync_litter_robot(historical: bool = False):
+    async with _sync_lock:
+        db = SessionLocal()
+        try:
+            from pylitterbot import Account, LitterRobot5
+            email, password = os.getenv("WHISKER_EMAIL"), os.getenv("WHISKER_PASSWORD")
+            if not email or not password:
+                raise RuntimeError("Whisker credentials are not set")
+
+            account = Account(robot_types=[LitterRobot5])
+            await account.connect(username=email, password=password, load_robots=True)
+            await build_pet_map(account)
+
+            limit = 1000 if historical else 200
+            new_count = pet_visits = 0
+            for robot in account.robots:
+                try:
+                    level = getattr(robot, "waste_drawer_level", None)
+                    litter = getattr(robot, "litter_level", None)
+                    online = getattr(robot, "is_online", True)
+                    db.add(RobotStatus(timestamp=utc_now(), waste_drawer_level=level,
+                                       litter_level=str(litter) if litter is not None else None,
+                                       is_online=1 if online else 0))
+                    db.commit()
+                except Exception as e:
+                    print(f"[STATUS] {e}")
+                    db.rollback()
+
+                for activity in await robot.get_activities(limit=limit):
+                    ad = activity if isinstance(activity, dict) else (vars(activity) if hasattr(activity, "__dict__") else {})
+                    if ad.get("type") != "PET_VISIT":
+                        continue
+                    pet_visits += 1
+                    ts = parse_ts(ad.get("timestamp"))
+                    if ts is None:
+                        continue
+                    cat, pid = get_cat_name(ad)
+                    exists = db.query(LitterVisit.id).filter(
+                        LitterVisit.timestamp == ts, LitterVisit.cat_name == cat).first()
+                    if exists:
+                        continue
+                    db.add(LitterVisit(
+                        cat_name=cat, pet_id=pid, timestamp=ts,
+                        waste_type=ad.get("wasteType") or "Unknown",
+                        duration_seconds=ad.get("duration"),
+                        weight_grams=ad.get("petWeight"),
+                        waste_weight_grams=ad.get("wasteWeight"),
+                    ))
+                    new_count += 1
+            db.commit()
+            await account.disconnect()
+
+            msg = f"Sync successful: {new_count} new visits ({pet_visits} pet visits checked)"
+            db.add(SyncLog(timestamp=utc_now(), status="success", message=msg))
+            db.commit()
+            print(f"[SYNC] {msg}")
+        except Exception as e:
+            import traceback
+            print(f"[SYNC] error: {e}\n{traceback.format_exc()}")
+            db.rollback()
+            db.add(SyncLog(timestamp=utc_now(), status="error", message=str(e)[:500]))
+            db.commit()
+        finally:
+            db.close()
+
+    await run_alerts()
+
+
+# ── Shared data loading ──────────────────────────────────────────────────────
+
+def load_assessed(db, days: int = HISTORY_DAYS):
+    since = utc_now() - timedelta(days=days)
+    rows = db.query(LitterVisit).filter(LitterVisit.timestamp >= since).all()
+    overrides = {o.visit_id: o for o in db.query(VisitOverride).all()}
+    return assess(rows, overrides)
+
+
+def latest_robot(db) -> Optional[dict]:
+    s = db.query(RobotStatus).order_by(RobotStatus.timestamp.desc()).first()
+    if not s:
+        return None
+    return {"waste_drawer_level": s.waste_drawer_level, "litter_level": s.litter_level,
+            "is_online": s.is_online, "last_checked": iso_utc(s.timestamp)}
+
+
+def last_success(db) -> Optional[datetime]:
+    s = db.query(SyncLog).filter(SyncLog.status == "success").order_by(SyncLog.timestamp.desc()).first()
+    return s.timestamp if s else None
+
+
+async def run_alerts():
     db = SessionLocal()
     try:
-        from pylitterbot import Account, LitterRobot5
-        email = os.getenv("WHISKER_EMAIL")
-        password = os.getenv("WHISKER_PASSWORD")
-        if not email or not password:
-            raise Exception("Whisker credentials not found in .env file")
-
-        account = Account(robot_types=[LitterRobot5])
-        await account.connect(username=email, password=password, load_robots=True)
-        await build_pet_map(account)
-
-        limit = 1000 if historical else 200
-        new_count = 0
-        total_activities = 0
-        pet_visits_found = 0
-
-        for robot in account.robots:
-            # Save robot status
-            try:
-                waste_level = None
-                litter_level = None
-                if hasattr(robot, 'waste_drawer_level'):
-                    waste_level = robot.waste_drawer_level
-                elif hasattr(robot, 'wasteDrwrLvl'):
-                    waste_level = robot.wasteDrwrLvl
-                if hasattr(robot, 'litter_level'):
-                    litter_level = str(robot.litter_level)
-
-                status = RobotStatus(
-                    timestamp=datetime.now(),
-                    waste_drawer_level=waste_level,
-                    litter_level=litter_level,
-                    is_online=1
-                )
-                db.add(status)
-                db.commit()
-            except Exception as e:
-                print(f"[STATUS] Could not save robot status: {e}")
-
-            activities = await robot.get_activities(limit=limit)
-            total_activities = len(activities)
-
-            for activity in activities:
-                if isinstance(activity, dict):
-                    ad = activity
-                elif hasattr(activity, '__dict__'):
-                    ad = vars(activity)
-                else:
-                    ad = {}
-
-                if ad.get('type', '') != 'PET_VISIT':
-                    continue
-
-                pet_visits_found += 1
-                cat_name = get_cat_name(ad)
-
-                waste_type = ad.get('wasteType', 'Unknown')
-                if waste_type is None:
-                    waste_type = 'Unknown'
-
-                timestamp_str = ad.get('timestamp', None)
-                timestamp = datetime.now()
-                if timestamp_str:
-                    try:
-                        timestamp = datetime.fromisoformat(
-                            timestamp_str.replace('Z', '+00:00')
-                        ).replace(tzinfo=None)
-                    except:
-                        pass
-
-                duration = ad.get('duration', None)
-                weight = ad.get('petWeight', None)
-                waste_weight = ad.get('wasteWeight', None)
-
-                existing = db.query(LitterVisit).filter(
-                    LitterVisit.cat_name == cat_name,
-                    LitterVisit.timestamp == timestamp
-                ).first()
-
-                if not existing:
-                    visit = LitterVisit(
-                        cat_name=cat_name,
-                        timestamp=timestamp,
-                        waste_type=waste_type,
-                        duration_seconds=duration,
-                        weight_grams=weight,
-                        waste_weight_grams=waste_weight
-                    )
-                    db.add(visit)
-                    new_count += 1
-
-        db.commit()
-        await account.disconnect()
-
-        msg = f"Sync successful - {new_count} new visits added ({pet_visits_found} pet visits in {total_activities} activities)"
-        log = SyncLog(timestamp=datetime.now(), status="success", message=msg)
-        db.add(log)
-        db.commit()
-        print(f"[{datetime.now()}] {msg}")
-
+        visits = load_assessed(db, days=60)
+        found = alerting.evaluate(visits, latest_robot(db), last_success(db))
+        logged = await alerting.process(db, found)
+        if logged:
+            print(f"[ALERTS] {logged}")
     except Exception as e:
-        import traceback
-        error_msg = str(e)
-        print(f"[{datetime.now()}] Sync error: {error_msg}")
-        print(traceback.format_exc())
-        log = SyncLog(timestamp=datetime.now(), status="error", message=error_msg)
-        db.add(log)
-        db.commit()
+        print(f"[ALERTS] error: {e}")
     finally:
         db.close()
 
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+def _counts(vs):
+    return {"urine": sum(1 for v in vs if v.waste_type == "Urine"),
+            "feces": sum(1 for v in vs if v.waste_type == "Feces"),
+            "total": len(vs)}
+
+
+def build_summary(visits, now: Optional[datetime] = None) -> dict:
+    now = now or utc_now()
+    today = local_date(now)
+    by_day = {}
+    for v in visits:
+        by_day.setdefault(local_date(v.ts), []).append(v)
+
+    def possible_for(cat, vs):
+        """Unattributed visits that could belong to `cat` (not clearly the other cat)."""
+        return [v for v in vs if v.counted and v.cat is None and (v.likely_cat in (None, cat))]
+
+    results = {}
+    for cat in CATS:
+        mine = [v for v in visits if v.cat == cat and v.counted]
+
+        def day_entry(d, with_unknown=True):
+            vs = by_day.get(d, [])
+            c = _counts([v for v in vs if v.cat == cat and v.counted])
+            if with_unknown:
+                pos = possible_for(cat, vs)
+                c["unknown"] = len(pos)
+                c["likely"] = sum(1 for v in pos if v.likely_cat == cat)
+            return c
+
+        today_c = day_entry(today)
+        today_pos = possible_for(cat, by_day.get(today, []))
+
+        urine_status = "red" if today_c["urine"] > 6 else "yellow" if today_c["urine"] > 4 else "green"
+        feces_status = ("red" if today_c["feces"] > 3 else
+                        "yellow" if today_c["feces"] == 0 and to_local(now).hour > 14 else "green")
+
+        week_trend = {str(d): day_entry(d) for d in days_back(today, 7)}
+        month_trend = {str(d): day_entry(d) for d in days_back(today, 30)}
+
+        def weekly(n_weeks):
+            out = {}
+            for i in range(n_weeks):
+                end = today - timedelta(weeks=i)
+                start = end - timedelta(days=6)
+                vs = [v for v in mine if start <= local_date(v.ts) <= end]
+                out[str(start)] = _counts(vs)
+            return out
+
+        # Weight: daily median of trusted readings, in lbs.
+        weight_trend, duration_trend, waste_trend = {}, {}, {}
+        for d in days_back(today, 90):
+            vs = [v for v in by_day.get(d, []) if v.cat == cat and v.counted]
+            w = [v.weight_lbs for v in vs if v.use_weight]
+            if w:
+                weight_trend[str(d)] = round(median(w), 2)
+            if d >= today - timedelta(days=29):
+                du = [v.duration for v in vs if v.use_duration]
+                if du:
+                    duration_trend[str(d)] = round(sum(du) / len(du), 1)
+                ww = [v.waste for v in vs if v.use_waste]
+                if ww:
+                    waste_trend[str(d)] = round(sum(ww), 1)
+
+        recent90 = [v for v in mine if local_date(v.ts) >= today - timedelta(days=89)]
+        hour_pattern = {str(h): {"urine": 0, "feces": 0} for h in range(24)}
+        for v in recent90:
+            h = str(to_local(v.ts).hour)
+            if v.waste_type == "Urine":
+                hour_pattern[h]["urine"] += 1
+            elif v.waste_type == "Feces":
+                hour_pattern[h]["feces"] += 1
+
+        span_days = (today - min(local_date(v.ts) for v in recent90)).days + 1 if recent90 else 0
+        trusted = [v.weight_lbs for v in sorted(mine, key=lambda v: v.ts) if v.use_weight]
+        latest_w = round(median(trusted[-5:]), 2) if trusted else None
+        base_w = [v.weight_lbs for v in mine if v.use_weight and v.ts >= now - timedelta(days=30)]
+        base_w = round(median(base_w), 2) if base_w else None
+
+        results[cat] = {
+            "today": {
+                **{k: today_c[k] for k in ("urine", "feces", "total")},
+                "urine_status": urine_status, "feces_status": feces_status,
+                "unknown_urine": sum(1 for v in today_pos if v.waste_type == "Urine"),
+                "unknown_feces": sum(1 for v in today_pos if v.waste_type == "Feces"),
+                "unknown_total": len(today_pos),
+                "likely_total": today_c["likely"],
+            },
+            "averages": {
+                "daily_urine": round(sum(1 for v in recent90 if v.waste_type == "Urine") / max(span_days, 1), 1),
+                "daily_feces": round(sum(1 for v in recent90 if v.waste_type == "Feces") / max(span_days, 1), 1),
+                "days_tracked": span_days,
+                "total_days_tracked": (today - min(local_date(v.ts) for v in mine)).days + 1 if mine else 0,
+                "latest_weight_lbs": latest_w,
+                "baseline_weight_lbs": base_w,
+            },
+            "week_trend": week_trend,
+            "month_trend": month_trend,
+            "quarter_trend": weekly(13),
+            "year_trend": weekly(52),
+            "hour_pattern": hour_pattern,
+            "weight_trend": weight_trend,
+            "duration_trend": duration_trend,
+            "waste_trend": waste_trend,
+        }
+    return results
+
+
+def visit_json(v):
+    return {
+        "id": v.id, "cat_name": v.cat or ("Unknown" if v.reported_cat not in CATS else v.reported_cat),
+        "reported_cat": v.reported_cat, "counted_as": v.cat, "likely_cat": v.likely_cat,
+        "timestamp": iso_utc(v.ts), "waste_type": v.waste_type, "duration_seconds": v.duration,
+        "weight_lbs": v.weight_lbs, "waste_weight": v.waste,
+        "use_weight": v.use_weight, "use_waste": v.use_waste, "counted": v.counted,
+        "flags": v.flags, "reason": v.reason, "override": v.override,
+    }
+
+
+# ── Routes ───────────────────────────────────────────────────────────────────
+
 @app.get("/api/health")
 def health_check():
-    return {"status": "ok", "timestamp": datetime.now().isoformat()}
+    return {"status": "ok", "timestamp": iso_utc(utc_now()), "data_dir": DATA_DIR}
+
 
 @app.get("/api/robot/status")
 def get_robot_status():
     db = SessionLocal()
     try:
-        latest = db.query(RobotStatus).order_by(RobotStatus.timestamp.desc()).first()
-        if latest:
-            return {
-                "waste_drawer_level": latest.waste_drawer_level,
-                "litter_level": latest.litter_level,
-                "is_online": latest.is_online,
-                "last_checked": latest.timestamp.isoformat()
-            }
-        return {"waste_drawer_level": None, "litter_level": None, "is_online": None}
+        return latest_robot(db) or {"waste_drawer_level": None, "litter_level": None, "is_online": None}
     finally:
         db.close()
+
 
 @app.get("/api/litter/summary")
 def get_litter_summary():
     db = SessionLocal()
     try:
-        today = datetime.now().date()
-        week_ago = datetime.now() - timedelta(days=7)
-        month_ago = datetime.now() - timedelta(days=30)
-        ninety_ago = datetime.now() - timedelta(days=90)
-
-        today_unknown = db.query(LitterVisit).filter(
-            LitterVisit.cat_name == "Unknown",
-            LitterVisit.timestamp >= datetime.combine(today, datetime.min.time())
-        ).all()
-        unknown_urine = sum(1 for v in today_unknown if v.waste_type == "Urine")
-        unknown_feces = sum(1 for v in today_unknown if v.waste_type == "Feces")
-        unknown_total = len(today_unknown)
-
-        results = {}
-        for cat in ["Lychee", "Guava"]:
-            today_v = db.query(LitterVisit).filter(
-                LitterVisit.cat_name == cat,
-                LitterVisit.timestamp >= datetime.combine(today, datetime.min.time())
-            ).all()
-
-            week_v = db.query(LitterVisit).filter(
-                LitterVisit.cat_name == cat,
-                LitterVisit.timestamp >= week_ago
-            ).all()
-
-            month_v = db.query(LitterVisit).filter(
-                LitterVisit.cat_name == cat,
-                LitterVisit.timestamp >= month_ago
-            ).all()
-
-            all_v = db.query(LitterVisit).filter(
-                LitterVisit.cat_name == cat,
-                LitterVisit.timestamp >= ninety_ago
-            ).order_by(LitterVisit.timestamp).all()
-
-            today_urine = sum(1 for v in today_v if v.waste_type == "Urine")
-            today_feces = sum(1 for v in today_v if v.waste_type == "Feces")
-            today_total = len(today_v)
-
-            urine_status = "green"
-            if today_urine > 6: urine_status = "red"
-            elif today_urine > 4: urine_status = "yellow"
-
-            feces_status = "green"
-            if today_feces == 0 and datetime.now().hour > 14: feces_status = "yellow"
-            elif today_feces > 3: feces_status = "red"
-
-            # Weight trend (30 days, daily avg)
-            weight_trend = {}
-            for i in range(30):
-                day = (datetime.now() - timedelta(days=i)).date()
-                day_v = [v for v in month_v if v.timestamp.date() == day and v.weight_grams]
-                if day_v:
-                    weight_trend[str(day)] = round(sum(v.weight_grams for v in day_v) / len(day_v), 1)
-
-            # Duration trend (30 days, avg seconds)
-            duration_trend = {}
-            for i in range(30):
-                day = (datetime.now() - timedelta(days=i)).date()
-                day_v = [v for v in month_v if v.timestamp.date() == day and v.duration_seconds]
-                if day_v:
-                    duration_trend[str(day)] = round(sum(v.duration_seconds for v in day_v) / len(day_v), 1)
-
-            # Waste weight trend (30 days)
-            waste_trend = {}
-            for i in range(30):
-                day = (datetime.now() - timedelta(days=i)).date()
-                day_v = [v for v in month_v if v.timestamp.date() == day and v.waste_weight_grams is not None]
-                if day_v:
-                    waste_trend[str(day)] = round(sum(v.waste_weight_grams for v in day_v), 1)
-
-            # Visit trend
-            week_trend = {}
-            for i in range(7):
-                day = (datetime.now() - timedelta(days=i)).date()
-                day_v2 = [v for v in week_v if v.timestamp.date() == day]
-                day_unk = db.query(LitterVisit).filter(
-                    LitterVisit.cat_name == "Unknown",
-                    LitterVisit.timestamp >= datetime.combine(day, datetime.min.time()),
-                    LitterVisit.timestamp < datetime.combine(day + timedelta(days=1), datetime.min.time())
-                ).all()
-                week_trend[str(day)] = {
-                    "urine": sum(1 for v in day_v2 if v.waste_type == "Urine"),
-                    "feces": sum(1 for v in day_v2 if v.waste_type == "Feces"),
-                    "total": len(day_v2),
-                    "unknown": len(day_unk)
-                }
-
-            month_trend = {}
-            for i in range(30):
-                day = (datetime.now() - timedelta(days=i)).date()
-                day_v2 = [v for v in month_v if v.timestamp.date() == day]
-                month_trend[str(day)] = {
-                    "urine": sum(1 for v in day_v2 if v.waste_type == "Urine"),
-                    "feces": sum(1 for v in day_v2 if v.waste_type == "Feces"),
-                    "total": len(day_v2)
-                }
-
-            quarter_trend = {}
-            for i in range(13):
-                ws = datetime.now().date() - timedelta(weeks=i+1)
-                we = datetime.now().date() - timedelta(weeks=i)
-                wv = [v for v in all_v if ws <= v.timestamp.date() <= we]
-                quarter_trend[str(ws)] = {
-                    "urine": sum(1 for v in wv if v.waste_type == "Urine"),
-                    "feces": sum(1 for v in wv if v.waste_type == "Feces"),
-                    "total": len(wv)
-                }
-
-            hour_pattern = {str(h): {"urine": 0, "feces": 0} for h in range(24)}
-            for v in all_v:
-                h = str(v.timestamp.hour)
-                if v.waste_type == "Urine": hour_pattern[h]["urine"] += 1
-                elif v.waste_type == "Feces": hour_pattern[h]["feces"] += 1
-
-            total_days = len(set(v.timestamp.date() for v in all_v))
-            avg_urine = round(sum(1 for v in all_v if v.waste_type == "Urine") / max(total_days, 1), 1)
-            avg_feces = round(sum(1 for v in all_v if v.waste_type == "Feces") / max(total_days, 1), 1)
-
-            # Latest weight
-            latest_weight = None
-            weight_visits = [v for v in all_v if v.weight_grams]
-            if weight_visits:
-                latest_weight = weight_visits[-1].weight_grams
-
-            results[cat] = {
-                "today": {
-                    "urine": today_urine,
-                    "feces": today_feces,
-                    "total": today_total,
-                    "urine_status": urine_status,
-                    "feces_status": feces_status,
-                    "unknown_urine": unknown_urine,
-                    "unknown_feces": unknown_feces,
-                    "unknown_total": unknown_total
-                },
-                "averages": {
-                    "daily_urine": avg_urine,
-                    "daily_feces": avg_feces,
-                    "days_tracked": total_days,
-                    "latest_weight_grams": latest_weight
-                },
-                "week_trend": week_trend,
-                "month_trend": month_trend,
-                "quarter_trend": quarter_trend,
-                "hour_pattern": hour_pattern,
-                "weight_trend": weight_trend,
-                "duration_trend": duration_trend,
-                "waste_trend": waste_trend
-            }
-
-        return results
+        return build_summary(load_assessed(db))
     finally:
         db.close()
+
 
 @app.get("/api/litter/recent")
-def get_recent_visits():
+def get_recent_visits(limit: int = 50, flagged_only: bool = False):
     db = SessionLocal()
     try:
-        visits = db.query(LitterVisit).order_by(LitterVisit.timestamp.desc()).limit(50).all()
-        return [{
-            "id": v.id,
-            "cat_name": v.cat_name,
-            "timestamp": v.timestamp.isoformat(),
-            "waste_type": v.waste_type,
-            "duration_seconds": v.duration_seconds,
-            "weight_grams": v.weight_grams,
-            "waste_weight_grams": v.waste_weight_grams
-        } for v in visits]
+        vs = sorted(load_assessed(db, days=60), key=lambda v: v.ts, reverse=True)
+        if flagged_only:
+            vs = [v for v in vs if not v.counted or v.cat is None or not v.use_weight
+                  or "waste_outlier" in v.flags or v.override]
+        return [visit_json(v) for v in vs[:max(1, min(limit, 500))]]
     finally:
         db.close()
+
+
+@app.get("/api/quality")
+def get_quality(days: int = 30):
+    db = SessionLocal()
+    try:
+        vs = load_assessed(db)
+        report = quality_report(vs, utc_now() - timedelta(days=days))
+        report["days"] = days
+        report["flag_text"] = FLAG_TEXT
+        return report
+    finally:
+        db.close()
+
+
+class OverrideIn(BaseModel):
+    action: str                    # exclude | include | assign
+    assign_to: Optional[str] = None
+    note: Optional[str] = None
+
+
+@app.post("/api/visits/{visit_id}/override")
+def set_override(visit_id: int, body: OverrideIn):
+    if body.action not in ("exclude", "include", "assign"):
+        raise HTTPException(400, "action must be exclude, include, or assign")
+    if body.action == "assign" and body.assign_to not in CATS:
+        raise HTTPException(400, f"assign_to must be one of {CATS}")
+    db = SessionLocal()
+    try:
+        if not db.get(LitterVisit, visit_id):
+            raise HTTPException(404, "visit not found")
+        o = db.query(VisitOverride).filter(VisitOverride.visit_id == visit_id).first() or VisitOverride(visit_id=visit_id)
+        o.action, o.assign_to, o.note, o.created_at = body.action, body.assign_to, body.note, utc_now()
+        db.add(o)
+        db.commit()
+        return {"ok": True}
+    finally:
+        db.close()
+
+
+@app.delete("/api/visits/{visit_id}/override")
+def clear_override(visit_id: int):
+    db = SessionLocal()
+    try:
+        db.query(VisitOverride).filter(VisitOverride.visit_id == visit_id).delete()
+        db.commit()
+        return {"ok": True}
+    finally:
+        db.close()
+
+
+@app.get("/api/alerts")
+def get_alerts(limit: int = 20):
+    db = SessionLocal()
+    try:
+        rows = db.query(AlertLog).order_by(AlertLog.created_at.desc()).limit(min(limit, 200)).all()
+        return {
+            "channels": alerting.channels_configured(),
+            "alerts": [{"id": a.id, "severity": a.severity, "cat": a.cat_name, "title": a.title,
+                        "message": a.message, "created_at": iso_utc(a.created_at),
+                        "delivered": a.delivered} for a in rows],
+        }
+    finally:
+        db.close()
+
+
+_last_test = {"at": None}
+
+
+@app.post("/api/alerts/test")
+async def test_alert():
+    now = utc_now()
+    if _last_test["at"] and (now - _last_test["at"]).total_seconds() < 60:
+        raise HTTPException(429, "Wait a minute between test alerts")
+    _last_test["at"] = now
+    delivered = await alerting.send("Cat dashboard test", "Alerts are working.", "info")
+    return {"delivered": delivered, "channels": alerting.channels_configured()}
+
+
+@app.get("/api/export.csv")
+def export_csv():
+    db = SessionLocal()
+    try:
+        vs = sorted(load_assessed(db, days=3650), key=lambda v: v.ts)
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["local_time", "reported_cat", "counted_as", "likely_cat", "waste_type",
+                    "duration_s", "weight_lbs", "waste_weight", "weight_used", "notes"])
+        for v in vs:
+            w.writerow([to_local(v.ts).strftime("%Y-%m-%d %H:%M"), v.reported_cat, v.cat or "",
+                        v.likely_cat or "", v.waste_type, v.duration or "", v.weight_lbs or "",
+                        v.waste or "", "yes" if v.use_weight else "no", v.reason])
+        buf.seek(0)
+        return StreamingResponse(iter([buf.getvalue()]), media_type="text/csv",
+                                 headers={"Content-Disposition": "attachment; filename=litter_visits.csv"})
+    finally:
+        db.close()
+
 
 @app.post("/api/sync")
 async def manual_sync():
@@ -399,10 +446,12 @@ async def manual_sync():
     finally:
         db.close()
 
+
 @app.post("/api/sync/historical")
 async def historical_sync():
     asyncio.create_task(sync_litter_robot(historical=True))
     return {"status": "started", "message": "Historical sync started."}
+
 
 @app.get("/api/sync/status")
 def get_sync_status():
@@ -410,29 +459,47 @@ def get_sync_status():
     try:
         last = db.query(SyncLog).order_by(SyncLog.timestamp.desc()).first()
         total = db.query(LitterVisit).count()
+        first = db.query(LitterVisit).order_by(LitterVisit.timestamp).first()
+        base = {"total_visits_stored": total, "first_visit": iso_utc(first.timestamp) if first else None,
+                "persistent": DATA_DIR not in (".", "")}
         if last:
-            return {
-                "last_sync": last.timestamp.isoformat(),
-                "status": last.status,
-                "message": last.message,
-                "total_visits_stored": total
-            }
-        return {"last_sync": None, "status": "never", "message": "No sync yet", "total_visits_stored": 0}
+            return {**base, "last_sync": iso_utc(last.timestamp), "status": last.status, "message": last.message}
+        return {**base, "last_sync": None, "status": "never", "message": "No sync yet"}
     finally:
         db.close()
 
+
+# ── Scheduler ────────────────────────────────────────────────────────────────
+
 scheduler = AsyncIOScheduler()
+
+
+async def send_digest():
+    db = SessionLocal()
+    try:
+        text = alerting.digest_text(build_summary(load_assessed(db, days=120)))
+    finally:
+        db.close()
+    await alerting.send("Daily cat summary", text, "info")
+
 
 @app.on_event("startup")
 async def startup_event():
-    scheduler.add_job(sync_litter_robot, 'interval', minutes=30, id='litter_sync')
+    scheduler.add_job(sync_litter_robot, "interval", minutes=int(os.getenv("SYNC_MINUTES", "30")), id="litter_sync")
+    digest_hour = os.getenv("DIGEST_HOUR")
+    if digest_hour:
+        from timeutil import TZ
+        scheduler.add_job(send_digest, "cron", hour=int(digest_hour), minute=0, timezone=TZ, id="digest")
     scheduler.start()
-    asyncio.create_task(sync_litter_robot(historical=True))
+    if os.getenv("DISABLE_STARTUP_SYNC") != "1":
+        asyncio.create_task(sync_litter_robot(historical=True))
+
 
 @app.on_event("shutdown")
 async def shutdown_event():
     scheduler.shutdown()
 
+
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)))

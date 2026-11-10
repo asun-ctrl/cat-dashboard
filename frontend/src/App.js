@@ -30,13 +30,17 @@ const T = {
 };
 
 // ── Tiny utilities ────────────────────────────────────────────────────────────
+// Day-only strings ("2026-11-09") parse as UTC midnight, which shows as the
+// previous day in US time zones. Treat them as local dates instead.
+const toDate = s => (typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s)) ? new Date(`${s}T00:00:00`) : new Date(s);
+
 const fmt = {
   g: v => v ? `${Math.round(v)}g` : '--',
-  lbs: v => v ? `${(v / 453.6).toFixed(1)} lbs` : '--',
+  lbs: v => v ? `${Number(v).toFixed(2)} lbs` : '--',
   dur: v => v ? (v >= 60 ? `${Math.round(v/60)}m ${v%60}s` : `${v}s`) : '--',
   pct: v => v != null ? `${Math.round(v)}%` : '--',
-  date: s => new Date(s).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
-  time: s => new Date(s).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }),
+  date: s => toDate(s).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
+  time: s => toDate(s).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }),
 };
 
 // ── Base components ───────────────────────────────────────────────────────────
@@ -171,18 +175,18 @@ function WeightChart({ data, accent }) {
   );
   const chartData = Object.entries(data)
     .sort(([a],[b]) => a.localeCompare(b))
-    .map(([date, val]) => ({ date: fmt.date(date), weight: Math.round(val) }));
+    .map(([date, val]) => ({ date: fmt.date(date), weight: Number(val.toFixed(2)) }));
   const weights = chartData.map(d => d.weight);
-  const min = Math.min(...weights) - 20;
-  const max = Math.max(...weights) + 20;
-  const avg = Math.round(weights.reduce((a,b)=>a+b,0)/weights.length);
+  const min = Math.floor((Math.min(...weights) - 0.3) * 10) / 10;
+  const max = Math.ceil((Math.max(...weights) + 0.3) * 10) / 10;
+  const avg = Number((weights.reduce((a,b)=>a+b,0)/weights.length).toFixed(2));
   return (
     <ResponsiveContainer width="100%" height={120}>
       <LineChart data={chartData} margin={{ top: 4, right: 4, left: -30, bottom: 0 }}>
         <CartesianGrid strokeDasharray="2 4" stroke={T.border} />
         <XAxis dataKey="date" tick={{ fontSize: 9, fill: T.textDim, fontFamily: T.mono }} interval="preserveStartEnd" />
         <YAxis domain={[min, max]} tick={{ fontSize: 9, fill: T.textDim, fontFamily: T.mono }} />
-        <Tooltip content={<ChartTip unit="g" />} />
+        <Tooltip content={<ChartTip unit=" lbs" />} />
         <ReferenceLine y={avg} stroke={T.textDim} strokeDasharray="3 3" />
         <Line type="monotone" dataKey="weight" name="Weight" stroke={accent} strokeWidth={1.5} dot={false} />
       </LineChart>
@@ -214,7 +218,7 @@ function DurationChart({ data, accent }) {
 }
 
 // ── Visit trend chart ─────────────────────────────────────────────────────────
-function VisitChart({ weekData, monthData, quarterData, accent }) {
+function VisitChart({ weekData, monthData, quarterData, yearData, accent }) {
   const [range, setRange] = useState('30d');
 
   const build = (src, labelFn) =>
@@ -225,14 +229,15 @@ function VisitChart({ weekData, monthData, quarterData, accent }) {
     }));
 
   const data =
-    range === '7d'  ? build(weekData, d => new Date(d).toLocaleDateString('en-US',{weekday:'short',month:'numeric',day:'numeric'})) :
+    range === '7d'  ? build(weekData, d => toDate(d).toLocaleDateString('en-US',{weekday:'short',month:'numeric',day:'numeric'})) :
     range === '30d' ? build(monthData, d => fmt.date(d)) :
-    build(quarterData, d => `Wk ${fmt.date(d)}`);
+    range === '90d' ? build(quarterData, d => `Wk ${fmt.date(d)}`) :
+    build(yearData, d => `Wk ${fmt.date(d)}`);
 
   return (
     <div>
       <div style={{ display: 'flex', gap: 6, marginBottom: 14 }}>
-        {['7d','30d','90d'].map(r => (
+        {['7d','30d','90d','1y'].map(r => (
           <button key={r} onClick={() => setRange(r)} style={{
             background: range === r ? T.borderHover : 'transparent',
             border: `1px solid ${range === r ? T.borderHover : T.border}`,
@@ -281,14 +286,16 @@ function CatPanel({ cat, data, accent }) {
   const [tab, setTab] = useState('overview');
   if (!data) return (
     <Card style={{ flex: 1 }}>
-      <div style={{ color: T.textMid, fontSize: 14 }}>{cat} — no data yet</div>
+      <div style={{ color: T.textMid, fontSize: 14 }}>{cat}: no data yet</div>
     </Card>
   );
 
-  const { today, averages, week_trend, month_trend, quarter_trend, hour_pattern, weight_trend, duration_trend } = data;
+  const { today, averages, week_trend, month_trend, quarter_trend, year_trend, hour_pattern, weight_trend, duration_trend } = data;
   const isGuava = cat === 'Guava';
   const hasAlert = today.feces_status === 'red' || today.urine_status === 'red';
-  const latestWeightLbs = averages.latest_weight_grams ? (averages.latest_weight_grams / 453.6).toFixed(1) : null;
+  const latestWeightLbs = averages.latest_weight_lbs ? averages.latest_weight_lbs.toFixed(2) : null;
+  const weightChange = averages.latest_weight_lbs && averages.baseline_weight_lbs
+    ? ((averages.latest_weight_lbs - averages.baseline_weight_lbs) / averages.baseline_weight_lbs) * 100 : null;
 
   const tabs = ['overview', 'trends', 'weight', 'patterns'];
 
@@ -308,7 +315,7 @@ function CatPanel({ cat, data, accent }) {
           </div>
           {latestWeightLbs && (
             <div style={{ fontSize: 11, color: T.textDim, fontFamily: T.mono, marginTop: 4 }}>
-              {latestWeightLbs} lbs · {averages.days_tracked}d tracked
+              {latestWeightLbs} lbs · {averages.total_days_tracked || averages.days_tracked}d tracked
             </div>
           )}
         </div>
@@ -326,7 +333,7 @@ function CatPanel({ cat, data, accent }) {
           background: T.red + '20', border: `1px solid ${T.red}40`,
           borderRadius: 6, padding: '10px 14px', marginBottom: 16, fontSize: 12, color: '#c46a6a'
         }}>
-          GI alert — {today.feces} confirmed bowel movements today
+          GI alert: {today.feces} confirmed bowel movements today
         </div>
       )}
 
@@ -335,9 +342,10 @@ function CatPanel({ cat, data, accent }) {
         <div style={{
           background: T.unknown, border: `1px solid ${T.border}`,
           borderRadius: 6, padding: '8px 12px', marginBottom: 16,
-          fontSize: 11, color: T.textDim, fontFamily: T.mono
+          fontSize: 11, color: T.textMid, fontFamily: T.mono
         }}>
-          {today.unknown_total} unidentified visit{today.unknown_total > 1 ? 's' : ''} today — counts below may be understated
+          {today.unknown_total} unidentified visit{today.unknown_total > 1 ? 's' : ''} today could be {cat}
+          {today.likely_total > 0 ? ` (${today.likely_total} match ${cat}'s weight)` : ''}. Counts below may be understated.
         </div>
       )}
 
@@ -365,7 +373,7 @@ function CatPanel({ cat, data, accent }) {
             <StatBox label="Total" value={today.total} sub="visits" extra={today.unknown_total} accent={accent} />
           </div>
           <Label>7-day visit pattern</Label>
-          <VisitChart weekData={week_trend} monthData={month_trend} quarterData={quarter_trend} accent={accent} />
+          <VisitChart weekData={week_trend} monthData={month_trend} quarterData={quarter_trend} yearData={year_trend} accent={accent} />
         </div>
       )}
 
@@ -373,7 +381,7 @@ function CatPanel({ cat, data, accent }) {
       {tab === 'trends' && (
         <div>
           <Label>Visit trends (30d)</Label>
-          <VisitChart weekData={week_trend} monthData={month_trend} quarterData={quarter_trend} accent={accent} />
+          <VisitChart weekData={week_trend} monthData={month_trend} quarterData={quarter_trend} yearData={year_trend} accent={accent} />
           <Divider />
           <Label>Avg visit duration per day (seconds)</Label>
           <DurationChart data={duration_trend} accent={accent} />
@@ -386,21 +394,25 @@ function CatPanel({ cat, data, accent }) {
       {/* Tab: Weight */}
       {tab === 'weight' && (
         <div>
-          <Label>Weight per visit (grams, 30d)</Label>
+          <Label>Daily median weight (lbs, 90d, outliers removed)</Label>
           <WeightChart data={weight_trend} accent={accent} />
           <div style={{ fontSize: 10, color: T.textDim, fontFamily: T.mono, marginTop: 8, marginBottom: 20 }}>
-            Weight measured by Litter-Robot SmartScale on each visit
+            Readings that don't fit this cat's recent range are left out. See flagged visits below.
           </div>
           <Divider />
           <div style={{ display: 'flex', gap: 20 }}>
             <div>
               <div style={{ fontSize: 10, fontFamily: T.mono, color: T.textDim, marginBottom: 4 }}>LATEST</div>
-              <div style={{ fontSize: 20, fontWeight: 600, color: T.text }}>{fmt.lbs(averages.latest_weight_grams)}</div>
+              <div style={{ fontSize: 20, fontWeight: 600, color: T.text }}>{fmt.lbs(averages.latest_weight_lbs)}</div>
             </div>
             <div>
-              <div style={{ fontSize: 10, fontFamily: T.mono, color: T.textDim, marginBottom: 4 }}>NORMAL RANGE</div>
-              <div style={{ fontSize: 12, color: T.textMid, fontFamily: T.mono, marginTop: 4 }}>
-                {isGuava ? '5–10 lbs typical' : '6–12 lbs typical'}
+              <div style={{ fontSize: 10, fontFamily: T.mono, color: T.textDim, marginBottom: 4 }}>30-DAY BASELINE</div>
+              <div style={{ fontSize: 20, fontWeight: 600, color: T.textMid }}>{fmt.lbs(averages.baseline_weight_lbs)}</div>
+            </div>
+            <div>
+              <div style={{ fontSize: 10, fontFamily: T.mono, color: T.textDim, marginBottom: 4 }}>CHANGE</div>
+              <div style={{ fontSize: 20, fontWeight: 600, color: weightChange != null && weightChange <= -4 ? '#c46a6a' : T.textMid }}>
+                {weightChange != null ? `${weightChange > 0 ? '+' : ''}${weightChange.toFixed(1)}%` : '--'}
               </div>
             </div>
           </div>
@@ -410,7 +422,7 @@ function CatPanel({ cat, data, accent }) {
       {/* Tab: Patterns */}
       {tab === 'patterns' && (
         <div>
-          <Label>Activity by hour of day (all-time)</Label>
+          <Label>Activity by hour of day (90d)</Label>
           <HourHeatmap data={hour_pattern} accent={accent} />
           <div style={{ fontSize: 10, color: T.textDim, fontFamily: T.mono, marginTop: 10 }}>
             Darker = more visits at that hour
@@ -422,47 +434,182 @@ function CatPanel({ cat, data, accent }) {
 }
 
 // ── Recent visits table ───────────────────────────────────────────────────────
-function RecentVisits({ visits }) {
-  if (!visits?.length) return null;
+const catColor = c => c === 'Lychee' ? T.lychee : c === 'Guava' ? T.guava : T.textDim;
+
+function SmallBtn({ children, onClick, title }) {
+  return (
+    <button onClick={onClick} title={title} style={{
+      background: 'transparent', border: `1px solid ${T.border}`, borderRadius: 4,
+      padding: '2px 7px', color: T.textMid, fontSize: 9, fontFamily: T.mono,
+      cursor: 'pointer', letterSpacing: '0.06em', marginRight: 4
+    }}>{children}</button>
+  );
+}
+
+function RecentVisits({ onChanged }) {
+  const [visits, setVisits] = useState([]);
+  const [flaggedOnly, setFlaggedOnly] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      const r = await axios.get(`${API}/litter/recent`, { params: { limit: flaggedOnly ? 100 : 30, flagged_only: flaggedOnly } });
+      setVisits(r.data);
+    } catch {}
+  }, [flaggedOnly]);
+
+  useEffect(() => { load(); const t = setInterval(load, 60000); return () => clearInterval(t); }, [load]);
+
+  const act = async (id, body) => {
+    try {
+      if (body) await axios.post(`${API}/visits/${id}/override`, body);
+      else await axios.delete(`${API}/visits/${id}/override`);
+      await load();
+      if (onChanged) onChanged();
+    } catch {}
+  };
+
+  const quiet = /No waste weight|No weight reading|Very short visit/;
+
   return (
     <Card style={{ marginTop: 20 }}>
-      <Label>Recent visits</Label>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+        <Label style={{ marginBottom: 0 }}>{flaggedOnly ? 'Flagged visits (60d)' : 'Recent visits'}</Label>
+        <SmallBtn onClick={() => setFlaggedOnly(f => !f)}>{flaggedOnly ? 'SHOW ALL' : 'SHOW FLAGGED'}</SmallBtn>
+      </div>
+      {!visits.length && <div style={{ color: T.textDim, fontSize: 12, fontFamily: T.mono }}>Nothing to show.</div>}
       <div style={{ overflowX: 'auto' }}>
         <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12, fontFamily: T.mono }}>
           <thead>
             <tr style={{ borderBottom: `1px solid ${T.border}` }}>
-              {['Cat','Time','Type','Duration','Weight','Waste wt'].map(h => (
-                <th key={h} style={{ textAlign: 'left', padding: '6px 12px', color: T.textDim, fontWeight: 500, fontSize: 10, letterSpacing: '0.08em' }}>{h.toUpperCase()}</th>
+              {['Cat', 'Time', 'Type', 'Duration', 'Weight', 'Waste', 'Data check', ''].map(h => (
+                <th key={h} style={{ textAlign: 'left', padding: '6px 10px', color: T.textDim, fontWeight: 500, fontSize: 10, letterSpacing: '0.08em' }}>{h.toUpperCase()}</th>
               ))}
             </tr>
           </thead>
           <tbody>
-            {visits.slice(0, 20).map(v => {
-              const isUnknown = v.cat_name === 'Unknown' || v.cat_name?.startsWith('Cat-');
-              const accent = v.cat_name === 'Lychee' ? T.lychee : v.cat_name === 'Guava' ? T.guava : T.unknown;
+            {visits.map(v => {
+              const counted = v.counted_as;
+              const inferred = v.flags.includes('inferred_by_weight');
+              const badWeight = ['weight_outlier', 'weight_partial', 'matches_other_cat'].some(f => v.flags.includes(f));
+              const notes = v.reason ? v.reason.split('; ').filter(r => !quiet.test(r) && !(inferred && /No cat tag/.test(r))) : [];
+              const issue = notes.length > 0;
+              const label = counted || (v.likely_cat ? `${v.likely_cat}?` : 'Unknown');
+              const struck = { color: T.textDim, textDecoration: 'line-through' };
               return (
-                <tr key={v.id} style={{ borderBottom: `1px solid ${T.border}`, opacity: isUnknown ? 0.5 : 1 }}>
-                  <td style={{ padding: '8px 12px', color: accent, fontWeight: 500 }}>
-                    {isUnknown ? 'Unknown' : v.cat_name}
+                <tr key={v.id} style={{ borderBottom: `1px solid ${T.border}`, opacity: counted ? 1 : 0.6 }}>
+                  <td style={{ padding: '8px 10px', color: catColor(counted || v.likely_cat), fontWeight: 500 }}>
+                    {label}
+                    {v.reported_cat !== 'Unknown' && v.reported_cat !== counted && (
+                      <div style={{ fontSize: 9, color: T.textDim }}>tagged {v.reported_cat}</div>
+                    )}
                   </td>
-                  <td style={{ padding: '8px 12px', color: T.textMid }}>{fmt.time(v.timestamp)}</td>
-                  <td style={{ padding: '8px 12px' }}>
-                    <span style={{
-                      color: v.waste_type === 'Urine' ? T.urine : v.waste_type === 'Feces' ? T.feces : T.textDim,
-                      fontWeight: 500
-                    }}>
-                      {v.waste_type || '—'}
-                    </span>
+                  <td style={{ padding: '8px 10px', color: T.textMid, whiteSpace: 'nowrap' }}>{fmt.time(v.timestamp)}</td>
+                  <td style={{ padding: '8px 10px', color: v.waste_type === 'Urine' ? T.urine : v.waste_type === 'Feces' ? T.feces : T.textDim }}>{v.waste_type || '-'}</td>
+                  <td style={{ padding: '8px 10px', color: T.textMid }}>{fmt.dur(v.duration_seconds)}</td>
+                  <td style={{ padding: '8px 10px', ...(badWeight ? struck : { color: T.textMid }) }}>{fmt.lbs(v.weight_lbs)}</td>
+                  <td style={{ padding: '8px 10px', ...(v.flags.includes('waste_outlier') ? struck : { color: T.textMid }) }}>{fmt.g(v.waste_weight)}</td>
+                  <td style={{ padding: '8px 10px', fontSize: 10, color: issue ? '#c4a44a' : T.textDim, maxWidth: 220 }}>
+                    {issue ? notes.join('; ') : 'OK'}
                   </td>
-                  <td style={{ padding: '8px 12px', color: T.textMid }}>{fmt.dur(v.duration_seconds)}</td>
-                  <td style={{ padding: '8px 12px', color: T.textMid }}>{fmt.lbs(v.weight_grams)}</td>
-                  <td style={{ padding: '8px 12px', color: T.textMid }}>{fmt.g(v.waste_weight_grams)}</td>
+                  <td style={{ padding: '8px 10px', whiteSpace: 'nowrap' }}>
+                    {v.override ? (
+                      <SmallBtn onClick={() => act(v.id, null)} title="Undo your change">UNDO</SmallBtn>
+                    ) : (
+                      <>
+                        {v.likely_cat && (
+                          <SmallBtn onClick={() => act(v.id, { action: 'assign', assign_to: v.likely_cat })} title={`Count this as ${v.likely_cat}`}>
+                            IS {v.likely_cat.toUpperCase()}
+                          </SmallBtn>
+                        )}
+                        {issue && v.reported_cat !== 'Unknown' && (
+                          <SmallBtn onClick={() => act(v.id, { action: 'include' })} title="Reading is fine, keep it">KEEP</SmallBtn>
+                        )}
+                        <SmallBtn onClick={() => act(v.id, { action: 'exclude' })} title="Leave this visit out of all stats">DROP</SmallBtn>
+                      </>
+                    )}
+                  </td>
                 </tr>
               );
             })}
           </tbody>
         </table>
       </div>
+    </Card>
+  );
+}
+
+// ── Alerts panel ──────────────────────────────────────────────────────────────
+function AlertsPanel() {
+  const [data, setData] = useState(null);
+  const [testMsg, setTestMsg] = useState('');
+  const load = useCallback(async () => {
+    try { const r = await axios.get(`${API}/alerts`, { params: { limit: 8 } }); setData(r.data); } catch {}
+  }, []);
+  useEffect(() => { load(); const t = setInterval(load, 60000); return () => clearInterval(t); }, [load]);
+
+  const test = async () => {
+    try {
+      const r = await axios.post(`${API}/alerts/test`);
+      setTestMsg(r.data.delivered.length ? `Sent via ${r.data.delivered.join(', ')}` : 'No channel set up yet');
+    } catch (e) { setTestMsg(e.response?.status === 429 ? 'Wait a minute' : 'Failed'); }
+  };
+
+  const ch = data?.channels || {};
+  const sevColor = { critical: '#c46a6a', warning: '#c4a44a', info: T.textMid };
+  const on = [ch.ntfy && 'push', ch.sms && 'text'].filter(Boolean);
+  return (
+    <Card style={{ flex: 1, minWidth: 280 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+        <Label style={{ marginBottom: 0 }}>Alerts</Label>
+        <SmallBtn onClick={test}>SEND TEST</SmallBtn>
+      </div>
+      <div style={{ fontSize: 10, fontFamily: T.mono, color: on.length ? '#6ab87a' : '#c4a44a', marginBottom: 12 }}>
+        {on.length ? `Notifying by ${on.join(' + ')}` : 'No notification channel set. Alerts only show here.'}
+        {ch.quiet_hours ? ` · quiet ${ch.quiet_hours}` : ''}{testMsg ? ` · ${testMsg}` : ''}
+      </div>
+      {!data?.alerts?.length && <div style={{ color: T.textDim, fontSize: 12, fontFamily: T.mono }}>No alerts. All quiet.</div>}
+      {data?.alerts?.map(a => (
+        <div key={a.id} style={{ borderLeft: `2px solid ${sevColor[a.severity] || T.textDim}`, padding: '4px 10px', marginBottom: 10 }}>
+          <div style={{ fontSize: 12, color: T.text }}>{a.title}</div>
+          <div style={{ fontSize: 11, color: T.textMid, marginTop: 2 }}>{a.message}</div>
+          <div style={{ fontSize: 9, color: T.textDim, fontFamily: T.mono, marginTop: 3 }}>
+            {fmt.time(a.created_at)}{a.delivered === 'held' ? ' · held for quiet hours' : ''}
+          </div>
+        </div>
+      ))}
+    </Card>
+  );
+}
+
+// ── Data quality panel ────────────────────────────────────────────────────────
+function QualityPanel({ syncStatus, refreshKey }) {
+  const [q, setQ] = useState(null);
+  useEffect(() => { axios.get(`${API}/quality`).then(r => setQ(r.data)).catch(() => {}); }, [refreshKey]);
+  const rows = q ? [
+    ['Visits checked', q.visits],
+    ['Weight outliers left out', q.weight_outliers],
+    ['Likely mislabeled cat', q.mislabeled],
+    ['Untagged, matched by weight', q.inferred],
+    ['Untagged, no match', Math.max(0, q.unidentified - q.inferred)],
+    ['Waste weight outliers', q.waste_outliers],
+    ['Your manual fixes', q.manual],
+  ] : [];
+  return (
+    <Card style={{ flex: 1, minWidth: 280 }}>
+      <Label>Data quality (30d)</Label>
+      {rows.map(([k, v]) => (
+        <div key={k} style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, fontFamily: T.mono, color: T.textMid, padding: '3px 0' }}>
+          <span>{k}</span><span style={{ color: T.text }}>{v}</span>
+        </div>
+      ))}
+      <Divider />
+      <div style={{ fontSize: 10, fontFamily: T.mono, color: syncStatus?.persistent ? T.textDim : '#c4a44a' }}>
+        {syncStatus?.persistent ? 'History is saved and keeps growing' : 'Storage is not persistent. History resets on redeploy.'}
+        {syncStatus?.first_visit ? ` · since ${fmt.date(syncStatus.first_visit)}` : ''}
+      </div>
+      <a href={`${API}/export.csv`} style={{ display: 'inline-block', marginTop: 10, fontSize: 10, fontFamily: T.mono, color: T.textMid }}>
+        DOWNLOAD CSV FOR VET
+      </a>
     </Card>
   );
 }
@@ -482,7 +629,7 @@ function RobotStatus({ status }) {
     }}>
       <div>
         <span style={{ fontSize: 10, fontFamily: T.mono, color: T.textDim, marginRight: 10 }}>LITTER-ROBOT 5 PRO</span>
-        <span style={{ fontSize: 10, fontFamily: T.mono, color: '#6ab87a' }}>● ONLINE</span>
+        <span style={{ fontSize: 10, fontFamily: T.mono, color: status.is_online === 0 ? '#c46a6a' : '#6ab87a' }}>● {status.is_online === 0 ? 'OFFLINE' : 'ONLINE'}</span>
       </div>
       <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
         <span style={{ fontSize: 10, fontFamily: T.mono, color: T.textDim }}>WASTE DRAWER</span>
@@ -509,7 +656,7 @@ function RobotStatus({ status }) {
 // ── Main app ──────────────────────────────────────────────────────────────────
 export default function App() {
   const [summary, setSummary] = useState(null);
-  const [visits, setVisits] = useState([]);
+  const [refreshKey, setRefreshKey] = useState(0);
   const [syncStatus, setSyncStatus] = useState(null);
   const [robotStatus, setRobotStatus] = useState(null);
   const [syncing, setSyncing] = useState(false);
@@ -528,14 +675,13 @@ export default function App() {
     try {
       await axios.get(`${API}/health`);
       setBackendOk(true);
-      const [s, v, st, rs] = await Promise.all([
+      const [s, st, rs] = await Promise.all([
         axios.get(`${API}/litter/summary`),
-        axios.get(`${API}/litter/recent`),
         axios.get(`${API}/sync/status`),
         axios.get(`${API}/robot/status`)
       ]);
       setSummary(s.data);
-      setVisits(v.data);
+      setRefreshKey(k => k + 1);
       setSyncStatus(st.data);
       setRobotStatus(rs.data);
     } catch {
@@ -643,17 +789,23 @@ export default function App() {
           }
         </div>
 
+        {/* Alerts and data quality */}
+        <div style={{ display: 'flex', gap: 20, marginTop: 20, flexDirection: isMobile ? 'column' : 'row' }}>
+          <AlertsPanel />
+          <QualityPanel syncStatus={syncStatus} refreshKey={refreshKey} />
+        </div>
+
         {/* Recent visits */}
-        <RecentVisits visits={visits} />
+        <RecentVisits onChanged={fetchData} />
 
         {/* Reference */}
         <Card style={{ marginTop: 20 }}>
           <Label>Health reference</Label>
           <div style={{ display: 'flex', gap: 24, flexWrap: 'wrap', fontSize: 11, fontFamily: T.mono, color: T.textDim }}>
-            <span>URINE  2–4x/day normal · &gt;6x alert</span>
-            <span>FECES  1–2x/day normal · &gt;3x alert</span>
+            <span>URINE  2 to 4x/day normal · over 6x alert</span>
+            <span>FECES  1 to 2x/day normal · over 3x alert</span>
             <span>DURATION  longer visits may indicate straining</span>
-            <span>WEIGHT  measured per visit by SmartScale</span>
+            <span>WEIGHT  a sustained drop of 4% or more triggers an alert</span>
           </div>
         </Card>
       </div>

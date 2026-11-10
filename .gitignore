@@ -1,0 +1,7 @@
+node_modules/
+frontend/build/
+__pycache__/
+*.pyc
+*.db
+.env
+frontend/package-lock.json
