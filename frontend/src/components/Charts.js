@@ -184,3 +184,48 @@ export function DurationChart({ cat, trend, vital }) {
     </Block>
   );
 }
+
+// ── Eating (PetLibro feeder) ───────────────────────────────────────────────
+const timeWords = t => {
+  const [h, m] = String(t).split(':').map(Number);
+  if (Number.isNaN(h)) return t;
+  return `${h % 12 || 12}${m ? `:${String(m).padStart(2, '0')}` : ''} ${h < 12 ? 'AM' : 'PM'}`;
+};
+
+export function EatingBlock({ cat, data }) {
+  if (!data) return null;
+  const color = CAT_COLOR[cat];
+  const meals = data.meals || [];
+  const today = data.today || {};
+  const hist = (data.history || []).filter(h => h.eating_seconds != null);
+  const full = hist.slice(0, -1);
+  const avgMin = full.length ? full.reduce((a, h) => a + h.eating_seconds, 0) / full.length / 60 : null;
+
+  let takeaway = meals.length
+    ? `${cat}'s feeder serves ${meals.length} meal${meals.length > 1 ? 's' : ''} a day at ${meals.map(m => `${timeWords(m.time)}${m.portions ? ` (${m.portions} portion${m.portions > 1 ? 's' : ''})` : ''}`).join(' and ')}.`
+    : `Feeding schedule not available yet.`;
+  if (today.eating_sessions != null) {
+    takeaway += ` Today so far: ${today.eating_sessions} visits to the bowl`;
+    takeaway += today.eating_seconds != null ? `, about ${Math.round(today.eating_seconds / 60)} minutes of eating.` : '.';
+  }
+  if (avgMin != null && full.length >= 5) takeaway += ` A typical full day is about ${avgMin.toFixed(0)} minutes. Eating noticeably less than that for a day or two is worth watching.`;
+
+  const chart = hist.map(h => ({ d: h.day, label: fmt.day(h.day), min: +(h.eating_seconds / 60).toFixed(1), sessions: h.eating_sessions }));
+  return (
+    <Block title="Eating" takeaway={takeaway}
+      legend={chart.length > 1 && <div className="legend"><span><i style={{ background: color }} />Minutes at the bowl per day</span>{avgMin != null && <span><i className="line" style={{ background: C.axis }} />Typical day</span>}</div>}>
+      {chart.length > 1 ? (
+        <ResponsiveContainer width="100%" height={160}>
+          <BarChart data={chart} margin={{ top: 8, right: 8, left: 0, bottom: 0 }} barCategoryGap="25%">
+            <CartesianGrid stroke={C.grid} vertical={false} />
+            {avgMin != null && <ReferenceLine y={avgMin} stroke={C.axis} strokeDasharray="4 3" />}
+            <XAxis dataKey="label" tick={axisTick} tickLine={false} axisLine={{ stroke: C.grid }} minTickGap={20} />
+            <YAxis tick={axisTick} tickLine={false} axisLine={false} width={36} />
+            <Tooltip cursor={{ fill: 'rgba(29,33,51,.05)' }} content={<Tip render={p => <><b>{fmt.weekday(p.d)}</b>{p.min} minutes, {p.sessions ?? '?'} visits to the bowl</>} />} />
+            <Bar dataKey="min" fill={color} radius={[4, 4, 0, 0]} isAnimationActive={false} />
+          </BarChart>
+        </ResponsiveContainer>
+      ) : <p className="empty">Daily eating history starts building today. The chart appears after a couple of days.</p>}
+    </Block>
+  );
+}

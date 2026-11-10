@@ -174,7 +174,7 @@ a { color: inherit; }
 .toast { margin-top: 10px; font-size: 14px; color: var(--good); font-weight: 700; }
 
 /* behind the scenes */
-.backstage { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; }
+.backstage { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 20px; }
 .kv { display: flex; justify-content: space-between; gap: 12px; padding: 6px 0; font-size: 14.5px; border-top: 1px solid var(--line-soft); }
 .kv:first-of-type { border-top: 0; }
 .kv span:first-child { color: var(--ink-2); }

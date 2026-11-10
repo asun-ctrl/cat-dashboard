@@ -84,6 +84,46 @@ class Observation(Base):
     created_at = Column(DateTime, index=True)
 
 
+class KeyValue(Base):
+    __tablename__ = "kv"
+    key = Column(String, primary_key=True)
+    value = Column(Text)
+
+
+class PetlibroDevice(Base):
+    __tablename__ = "petlibro_devices"
+    sn = Column(String, primary_key=True)
+    name = Column(String, nullable=True)
+    product = Column(String, nullable=True)
+    kind = Column(String, nullable=True)       # feeder | fountain | other
+    cat = Column(String, nullable=True)
+    online = Column(Integer, nullable=True)
+    raw_list = Column(Text, nullable=True)
+    updated_at = Column(DateTime, nullable=True)
+
+
+class PetlibroDaily(Base):
+    """Latest response of each kind per device per local day (the last sync of a day is that day's total)."""
+    __tablename__ = "petlibro_daily"
+    id = Column(Integer, primary_key=True)
+    device_sn = Column(String, index=True)
+    day = Column(String, index=True)
+    kind = Column(String)
+    data = Column(Text)
+    updated_at = Column(DateTime)
+    __table_args__ = (UniqueConstraint("device_sn", "day", "kind", name="uq_pl_daily"),)
+
+
+class PetlibroEvent(Base):
+    __tablename__ = "petlibro_events"
+    id = Column(Integer, primary_key=True)
+    device_sn = Column(String, index=True)
+    timestamp = Column(DateTime, index=True)
+    type = Column(String)
+    data = Column(Text)
+    __table_args__ = (UniqueConstraint("device_sn", "timestamp", "type", name="uq_pl_event"),)
+
+
 class RobotStatus(Base):
     __tablename__ = "robot_status"
     id = Column(Integer, primary_key=True, index=True)

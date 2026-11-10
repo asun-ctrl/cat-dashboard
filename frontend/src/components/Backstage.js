@@ -56,3 +56,32 @@ export function QualityPanel({ q }) {
     </div>
   );
 }
+
+export function PetlibroPanel({ data, status }) {
+  if (!data?.configured && !data?.devices?.length) return null;
+  const feeders = (data?.devices || []).filter(d => d.kind === 'feeder');
+  const fountain = (data?.devices || []).find(d => d.kind === 'fountain');
+  return (
+    <div className="panel">
+      <h3 className="panel-title">Feeders and fountain</h3>
+      <p className="panel-sub">
+        {status?.status === 'petlibro_error' ? `PetLibro isn't responding: ${status.message}` :
+         status?.at ? `PetLibro, updated ${ago(status.at)}.` : 'Connecting to PetLibro.'}
+      </p>
+      {feeders.map(f => (
+        <div className="kv" key={f.sn}>
+          <span>{f.cat ? `${f.cat}'s feeder` : f.name || 'Feeder'}</span>
+          <span>{!f.online ? 'Offline' : f.outlet_blocked ? 'Food outlet blocked' : f.food_low ? 'Food running low' : 'OK'}</span>
+        </div>
+      ))}
+      {fountain && (
+        <>
+          <div className="meter" role="img" aria-label={`Fountain water ${fountain.water_percent ?? 'unknown'} percent`}>
+            <div style={{ width: `${fountain.water_percent || 0}%`, background: (fountain.water_percent ?? 100) < 25 ? '#C2412D' : '#4B8FD1' }} />
+          </div>
+          <div className="kv"><span>Fountain water</span><span>{fountain.water_percent != null ? `${Math.round(fountain.water_percent)}%` : (fountain.online ? '--' : 'Offline')}</span></div>
+        </>
+      )}
+    </div>
+  );
+}

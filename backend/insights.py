@@ -93,9 +93,12 @@ def _fmt(n: float, unit: str = "time") -> str:
     return f"{n:g} {unit}" + ("" if n == 1 else "s")
 
 
+_MEALS = {"times": FEEDING_TIMES}
+
+
 def _meal_minutes() -> list[int]:
     out = []
-    for t in FEEDING_TIMES:
+    for t in _MEALS["times"]:
         try:
             h, m = t.split(":")
             out.append(int(h) * 60 + int(m))
@@ -145,7 +148,8 @@ def possible_loose_stool(visits: list[Assessed], cat: str) -> set[int]:
 
 
 def build_insights(visits: list[Assessed], profiles: dict, weight_history: dict,
-                   observations: list, now: Optional[datetime] = None) -> dict:
+                   observations: list, now: Optional[datetime] = None, meal_times: Optional[dict] = None) -> dict:
+    meal_times = meal_times or {}
     now = now or utc_now()
     today = local_date(now)
     recent_days = [today - timedelta(days=i) for i in range(1, 8)]          # last 7 full days
@@ -157,6 +161,7 @@ def build_insights(visits: list[Assessed], profiles: dict, weight_history: dict,
     cats_out = []
     for cat in CATS:
         prof = profiles.get(cat) or {}
+        _MEALS["times"] = meal_times.get(cat) or FEEDING_TIMES   # real feeder schedule when known
         pron = "he" if (prof.get("gender") or "").upper() == "MALE" else "she"
         poss = "his" if pron == "he" else "her"
         findings = []
@@ -433,7 +438,10 @@ def build_insights(visits: list[Assessed], profiles: dict, weight_history: dict,
                          "summary": summary, "vitals": vitals, "findings": findings, "confidence": conf,
                          "profile": prof})
 
+    _MEALS["times"] = FEEDING_TIMES
     return {"generated_at": now.isoformat() + "Z", "cats": cats_out, "emergency": EMERGENCY,
             "sources": SOURCES, "feeding_times": FEEDING_TIMES,
+            "meal_times": {c: meal_times.get(c) or FEEDING_TIMES for c in CATS},
+            "meal_source": {c: "feeder" if meal_times.get(c) else "assumed" for c in CATS},
             "disclaimer": ("These notes compare your cats with general veterinary guidance and with their own history. "
                            "They are not a diagnosis. When in doubt, call your vet.")}

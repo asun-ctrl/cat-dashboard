@@ -3,9 +3,9 @@ import './styles.css';
 import { CATS, catVars, fmt, http } from './lib';
 import Hero from './components/Hero';
 import Findings from './components/Findings';
-import { DurationChart, RhythmChart, TripsChart, WeightChart } from './components/Charts';
+import { DurationChart, EatingBlock, RhythmChart, TripsChart, WeightChart } from './components/Charts';
 import CheckIn from './components/CheckIn';
-import { AlertsPanel, QualityPanel, RobotPanel } from './components/Backstage';
+import { AlertsPanel, PetlibroPanel, QualityPanel, RobotPanel } from './components/Backstage';
 import VisitLog from './components/VisitLog';
 
 export default function App() {
@@ -17,6 +17,7 @@ export default function App() {
   const [alerts, setAlerts] = useState(null);
   const [quality, setQuality] = useState(null);
   const [observations, setObservations] = useState([]);
+  const [petlibro, setPetlibro] = useState(null);
   const [selected, setSelected] = useState(CATS[1]);
   const [offline, setOffline] = useState(false);
   const [syncing, setSyncing] = useState(false);
@@ -29,6 +30,7 @@ export default function App() {
         http.get('/sync/status'), http.get('/alerts', { params: { limit: 6 } }), http.get('/quality'),
         http.get('/observations', { params: { days: 30 } }),
       ]);
+      http.get('/petlibro').then(r => setPetlibro(r.data)).catch(() => {});
       setInsights(ins.data); setSummary(sum.data); setPets(pt.data); setRobot(rs.data);
       setSync(st.data); setAlerts(al.data); setQuality(q.data); setObservations(ob.data);
       setOffline(false);
@@ -110,9 +112,10 @@ export default function App() {
             </div>
             <div className="panel">
               <WeightChart cat={selected} trend={s?.weight_trend} vital={cur.vitals?.weight} />
+              <EatingBlock cat={selected} data={petlibro?.cats?.[selected]} />
               <TripsChart cat={selected} week={s?.week_trend} month={s?.month_trend} year={s?.year_trend} />
               <RhythmChart cat={selected} hours={s?.hour_pattern} daysTracked={s?.averages?.days_tracked}
-                           feedingTimes={insights.feeding_times} afterMeal={cur.vitals?.after_meal} />
+                           feedingTimes={insights.meal_times?.[selected] || insights.feeding_times} afterMeal={cur.vitals?.after_meal} />
               <DurationChart cat={selected} trend={s?.duration_trend} vital={cur.vitals?.duration} />
             </div>
           </div>
@@ -129,6 +132,7 @@ export default function App() {
           </div>
           <div className="backstage">
             <RobotPanel robot={robot} sync={sync} />
+            <PetlibroPanel data={petlibro} status={sync?.petlibro} />
             <AlertsPanel data={alerts} />
             <QualityPanel q={quality} />
           </div>

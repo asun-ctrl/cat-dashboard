@@ -20,6 +20,7 @@ import alerts as alerting  # noqa: E402
 from db import (AlertLog, LitterVisit, Observation, PetProfile, RobotStatus,  # noqa: E402
                 SessionLocal, SyncLog, VisitOverride, WeightHistory, init_db, DATA_DIR)
 from insights import build_insights, possible_loose_stool  # noqa: E402
+import petlibro  # noqa: E402
 from quality import CATS, FLAG_TEXT, assess, quality_report  # noqa: E402
 from timeutil import (days_back, iso_utc, local_date, local_midnight_utc,  # noqa: E402
                       to_local, utc_now)
@@ -211,7 +212,26 @@ async def sync_litter_robot(historical: bool = False):
         finally:
             db.close()
 
+    await sync_petlibro()
     await run_alerts()
+
+
+async def sync_petlibro():
+    if not petlibro.configured():
+        return
+    db = SessionLocal()
+    try:
+        msg = await petlibro.sync(db)
+        db.add(SyncLog(timestamp=utc_now(), status="petlibro", message=msg[:500]))
+        db.commit()
+        print(f"[PETLIBRO] {msg}")
+    except Exception as e:
+        db.rollback()
+        db.add(SyncLog(timestamp=utc_now(), status="petlibro_error", message=str(e)[:500]))
+        db.commit()
+        print(f"[PETLIBRO] error: {e}")
+    finally:
+        db.close()
 
 
 # ── Shared data loading ──────────────────────────────────────────────────────
@@ -541,9 +561,33 @@ def get_insights():
     try:
         visits = load_assessed(db, days=120)
         obs = db.query(Observation).filter(Observation.created_at >= utc_now() - timedelta(days=60)).all()
-        return build_insights(visits, _profiles(db), _weight_history(db), obs)
+        return build_insights(visits, _profiles(db), _weight_history(db), obs, meal_times=petlibro.meal_times(db))
     finally:
         db.close()
+
+
+@app.get("/api/petlibro")
+def get_petlibro():
+    db = SessionLocal()
+    try:
+        return petlibro.summary(db)
+    finally:
+        db.close()
+
+
+@app.get("/api/debug/petlibro")
+def debug_petlibro():
+    db = SessionLocal()
+    try:
+        return petlibro.debug_shapes(db)
+    finally:
+        db.close()
+
+
+@app.post("/api/petlibro/sync")
+async def petlibro_sync_now():
+    await sync_petlibro()
+    return get_sync_status()["petlibro"]
 
 
 @app.get("/api/pets")
@@ -699,11 +743,14 @@ async def historical_sync():
 def get_sync_status():
     db = SessionLocal()
     try:
-        last = db.query(SyncLog).order_by(SyncLog.timestamp.desc()).first()
+        last = db.query(SyncLog).filter(SyncLog.status.in_(["success", "error"])).order_by(SyncLog.timestamp.desc()).first()
+        pl = db.query(SyncLog).filter(SyncLog.status.like("petlibro%")).order_by(SyncLog.timestamp.desc()).first()
         total = db.query(LitterVisit).count()
         first = db.query(LitterVisit).order_by(LitterVisit.timestamp).first()
         base = {"total_visits_stored": total, "first_visit": iso_utc(first.timestamp) if first else None,
-                "persistent": DATA_DIR not in (".", "")}
+                "persistent": DATA_DIR not in (".", ""),
+                "petlibro": {"configured": petlibro.configured(), "status": pl.status if pl else None,
+                             "message": pl.message if pl else None, "at": iso_utc(pl.timestamp) if pl else None}}
         if last:
             return {**base, "last_sync": iso_utc(last.timestamp), "status": last.status, "message": last.message}
         return {**base, "last_sync": None, "status": "never", "message": "No sync yet"}
