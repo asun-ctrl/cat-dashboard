@@ -74,3 +74,14 @@ def test_photo_and_observations_api():
     assert c.delete(f"/api/observations/{oid}").json()["ok"]
     ins = c.get("/api/insights").json()
     assert ins["emergency"] and ins["sources"] and len(ins["cats"]) == 2
+
+def test_low_poop_with_normal_total_reads_as_mislabel():
+    rows, _ = make_rows(now=NOW, days=40)
+    # Recent week: robot calls almost every poop "pee"
+    for r in rows:
+        if r.cat_name == "Guava" and r.timestamp >= NOW - timedelta(days=8) and r.waste_type == "Feces":
+            r.waste_type = "Urine"
+    c = run(rows)["Guava"]
+    f = {x["id"]: x for x in c["findings"]}
+    assert "very little poop" in f["stool"]["title"] and "pee" in f["stool"]["detail"]
+    assert f["urine"]["level"] in ("info", "good"), f["urine"]["title"]

@@ -196,6 +196,11 @@ def build_insights(visits: list[Assessed], profiles: dict, weight_history: dict,
                 lvl = "watch"
                 title = f"{cat} has gained {ch:.1f}%"
                 action = "Usually diet or portion related. Worth checking portions, and asking your vet about a target weight."
+            elif ch >= 3:
+                lvl = "info"
+                title = f"{cat} has put on a little weight"
+                action = ("Nothing urgent. A small gain is often just portions or a change in food. If it keeps climbing, "
+                          "check portions or ask your vet about a target weight.")
             else:
                 lvl = "good"
                 title = f"{cat}'s weight is steady"
@@ -227,6 +232,12 @@ def build_insights(visits: list[Assessed], profiles: dict, weight_history: dict,
         # ── Pee frequency ───────────────────────────────────────────────────
         r_u = _daily(visits, cat, recent_days, "Urine")
         b_u = _daily(visits, cat, base_days, "Urine")
+        r_f = _daily(visits, cat, recent_days, "Feces")
+        b_f = _daily(visits, cat, base_days, "Feces")
+        r_all = _daily(visits, cat, recent_days)
+        # The robot can call poop "pee". When poop is rare but total trips are normal,
+        # treat that as a labelling problem rather than two separate health signals.
+        mislabel_suspected = bool(r_f and r_u and mean(r_f) < 0.7 and 3 <= mean(r_all) <= 6.5)
         gi_note = (f" The robot can log loose stool as pee, so some of {cat}'s pee visits may really be stool."
                    if cat in GI_WATCH else "")
         if r_u:
@@ -234,11 +245,16 @@ def build_insights(visits: list[Assessed], profiles: dict, weight_history: dict,
             bu = mean(b_u) if len(b_u) >= 7 else None
             vitals["urine"] = {"value": round(ru, 1), "unit": "per day", "typical": [2, 4],
                                "baseline": round(bu, 1) if bu is not None else None}
-            if ru > 6 or (bu and ru >= bu * 1.5 and ru - bu >= 1.5):
+            if ru > 6 or (bu and ru >= bu * 1.5 and ru - bu >= 1.5 and not mislabel_suspected):
                 lvl = "watch" if ru <= 8 else "concern"
                 title = f"{cat} is peeing more often than usual"
                 action = ("If she is also straining, crying, or leaving only small spots, call a vet today. "
                           "Otherwise, mention it at the next visit, especially if she's drinking more too.")
+            elif bu and ru - bu >= 1 and mislabel_suspected:
+                lvl = "info"
+                title = f"{cat}'s pee count is up, but some of it is probably poop"
+                action = ("Check the box for a few days and tap what you find below. If you see lots of small pee clumps, "
+                          "or she's straining, call your vet.")
             elif ru < 1.5 or (bu and ru <= bu * 0.5):
                 lvl = "concern"
                 title = f"{cat} is peeing less than usual"
@@ -251,7 +267,7 @@ def build_insights(visits: list[Assessed], profiles: dict, weight_history: dict,
             detail = f"About {_fmt(ru)} a day over the last week"
             detail += f", compared with {bu:.1f} before." if bu is not None else "."
             detail += " Most healthy cats pee 2 to 4 times a day."
-            if lvl == "good" and ru > 4.5:
+            if lvl == "good" and ru > 4.5 and (bu is None or abs(ru - bu) < 0.75):
                 detail += (f" {cat} is above that range but steady, and a change from {poss} own normal matters more "
                            "than the textbook number.")
             detail += gi_note
@@ -269,14 +285,19 @@ def build_insights(visits: list[Assessed], profiles: dict, weight_history: dict,
             })
 
         # ── Poop frequency ──────────────────────────────────────────────────
-        r_f = _daily(visits, cat, recent_days, "Feces")
         if r_f:
             rf = mean(r_f)
             vitals["stool"] = {"value": round(rf, 1), "unit": "per day", "typical": [1, 2]}
             last_poop = max((v.ts for v in visits if v.counted and v.waste_type == "Feces"
                              and (v.cat == cat or v.likely_cat == cat)), default=None)
             hours_since = (now - last_poop).total_seconds() / 3600 if last_poop else None
-            if hours_since is not None and hours_since >= 48:
+            if mislabel_suspected:
+                lvl = "watch"
+                title = f"The robot is logging very little poop for {cat}"
+                action = ("Take a quick look in the box or drawer and tap what you find below. A few check-ins tell us whether "
+                          "the robot is mislabelling or she really isn't going. Call your vet if you find no stool for 2 to 3 days "
+                          "or she's straining.")
+            elif hours_since is not None and hours_since >= 48:
                 lvl, title = "watch", f"No stool logged for {cat} in {int(hours_since // 24)} days"
                 action = ("Check the box yourself. If she's straining or hasn't pooped in 3 days, call your vet. "
                           "The robot can miss or mislabel stool, so a look is worth it.")
@@ -291,7 +312,11 @@ def build_insights(visits: list[Assessed], profiles: dict, weight_history: dict,
                 action = "Nothing to do."
             vitals["stool"]["level"] = lvl
             detail = f"About {_fmt(rf)} a day over the last week. Healthy adult cats usually go once or twice a day."
-            if cat in GI_WATCH:
+            if mislabel_suspected:
+                detail = (f"Only {_fmt(rf)} a day logged as poop this week, but {cat}'s total trips ({mean(r_all):.1f} a day) "
+                          "are normal. That pattern usually means the robot is calling some poops \"pee\", not that "
+                          f"{cat} isn't going.")
+            if cat in GI_WATCH and not mislabel_suspected:
                 detail += f" For {cat}, the robot may undercount because loose stool can be logged as pee."
             findings.append({
                 "id": "stool", "topic": "Pooping", "level": lvl, "title": title, "detail": detail,
