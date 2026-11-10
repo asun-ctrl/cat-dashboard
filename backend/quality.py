@@ -87,6 +87,18 @@ def to_lbs(raw) -> Optional[float]:
     return round(raw / WEIGHT_DIVISOR, 2)
 
 
+def _waste_invalid(row) -> bool:
+    """Whisker marks some waste weights as invalid; trust that."""
+    raw = getattr(row, "raw_json", None)
+    if not raw:
+        return False
+    try:
+        import json
+        return json.loads(raw).get("isWasteWeightValid") is False
+    except ValueError:
+        return False
+
+
 def _mad(values: list[float], center: float) -> float:
     return median(abs(v - center) for v in values) if values else 0.0
 
@@ -127,7 +139,7 @@ def assess(rows: Iterable, overrides: Optional[dict] = None) -> list[Assessed]:
             waste_type=r.waste_type or "Unknown",
             duration=r.duration_seconds,
             weight_lbs=to_lbs(r.weight_grams),
-            waste=r.waste_weight_grams,
+            waste=None if _waste_invalid(r) else r.waste_weight_grams,
             pet_id=getattr(r, "pet_id", None),
         )
         for r in rows

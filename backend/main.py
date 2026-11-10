@@ -120,7 +120,7 @@ async def sync_litter_robot(historical: bool = False):
                 raise RuntimeError("Whisker credentials are not set")
 
             account = Account(robot_types=[LitterRobot5])
-            await account.connect(username=email, password=password, load_robots=True)
+            await account.connect(username=email, password=password, load_robots=True, load_pets=True)
             await build_pet_map(account)
             save_pet_profiles(db, account)
 
@@ -630,7 +630,21 @@ def activity_keys():
     db = SessionLocal()
     try:
         v = db.query(LitterVisit).filter(LitterVisit.raw_json.isnot(None)).order_by(LitterVisit.timestamp.desc()).first()
-        return {"keys": sorted(json.loads(v.raw_json).keys()) if v else [], "has_event_id": bool(v and v.event_id)}
+        def shape(x, depth=0):
+            if isinstance(x, dict):
+                return {k: shape(val, depth + 1) for k, val in list(x.items())[:25]} if depth < 4 else "dict"
+            if isinstance(x, list):
+                return [shape(x[0], depth + 1)] if x else []
+            if isinstance(x, str):
+                return "url" if x.startswith("http") else "str"
+            return type(x).__name__
+        latest = db.query(LitterVisit).filter(LitterVisit.raw_json.isnot(None)).order_by(LitterVisit.timestamp.desc()).limit(50).all()
+        with_cam = next((json.loads(r.raw_json) for r in latest if json.loads(r.raw_json).get("cameraEvents")), None)
+        raw = json.loads(v.raw_json) if v else {}
+        return {"keys": sorted(raw.keys()), "has_event_id": bool(v and v.event_id),
+                "cameraEvents_shape": shape(with_cam.get("cameraEvents")) if with_cam else None,
+                "categories_shape": shape(raw.get("categories")), "subtype": raw.get("subtype"),
+                "waste_weight_valid_false": sum(1 for r in latest if json.loads(r.raw_json).get("isWasteWeightValid") is False)}
     finally:
         db.close()
 
