@@ -1,5 +1,7 @@
 import React from 'react';
-import { ago, fmt } from '../lib';
+import { ago, fmt, http } from '../lib';
+
+const fmtHour = h => { const n = parseInt(h, 10); return Number.isNaN(n) ? h : fmt.hourLong(n); };
 
 export function RobotPanel({ robot, sync }) {
   const lvl = robot?.waste_drawer_level;
@@ -20,6 +22,16 @@ export function RobotPanel({ robot, sync }) {
 }
 
 export function AlertsPanel({ data }) {
+  const [testMsg, setTestMsg] = React.useState('');
+  const sendTest = async () => {
+    setTestMsg('Sending…');
+    try {
+      const r = await http.post('/alerts/test');
+      setTestMsg(r.data.delivered?.length ? 'Sent. Check your phone.' : 'No notification app is connected yet.');
+    } catch (e) {
+      setTestMsg(e.response?.status === 429 ? 'Wait a minute before sending another.' : "Couldn't send. Try again shortly.");
+    }
+  };
   const ch = data?.channels || {};
   const on = [ch.ntfy && 'phone push', ch.sms && 'text'].filter(Boolean);
   const sev = { critical: 'concern', warning: 'watch', info: 'info' };
@@ -27,6 +39,18 @@ export function AlertsPanel({ data }) {
     <div className="panel">
       <h3 className="panel-title">Alerts</h3>
       <p className="panel-sub">{on.length ? `Sent to you by ${on.join(' and ')}.` : 'Shown here for now. Phone notifications can be turned on later.'}</p>
+      {(ch.ntfy || ch.sms) && (
+        <p style={{ margin: '4px 0 10px' }}>
+          <button className="mini-btn" onClick={sendTest}>Send a test notification</button>
+          {testMsg && <span className="vital-note" style={{ marginLeft: 6 }} role="status">{testMsg}</span>}
+        </p>
+      )}
+      {(ch.quiet_hours || ch.digest_hour) && (
+        <p className="vital-note" style={{ marginBottom: 8 }}>
+          {ch.quiet_hours && `Quiet from ${fmtHour(ch.quiet_hours.split('-')[0])} to ${fmtHour(ch.quiet_hours.split('-')[1])}, except urgent alerts. `}
+          {ch.digest_hour && `Daily summary at ${fmtHour(ch.digest_hour)}.`}
+        </p>
+      )}
       {!data?.alerts?.length && <p className="empty">Nothing needs your attention.</p>}
       {data?.alerts?.slice(0, 4).map(a => (
         <div key={a.id} className="alert-item">
