@@ -37,7 +37,9 @@ from fastapi import Request  # noqa: E402
 from fastapi.responses import JSONResponse  # noqa: E402
 
 OPEN_PATHS = {"/api/health", "/api/auth/check"}
-_failures: dict = {}
+MAX_TRIES = int(os.getenv("PASSCODE_MAX_TRIES", "3"))
+LOCK_SECONDS = 600
+_failures: dict = {}   # ip -> {hash of wrong passcode: time}
 
 
 def _passcode_ok(given: Optional[str]) -> bool:
@@ -47,20 +49,41 @@ def _passcode_ok(given: Optional[str]) -> bool:
     return bool(given) and hmac.compare_digest(given.strip().encode(), code.strip().encode())
 
 
+def _client_ip(request) -> str:
+    return request.headers.get("x-forwarded-for", request.client.host if request.client else "?").split(",")[0].strip()
+
+
+def _wrong(ip: str) -> dict:
+    now = time.time()
+    tries = {h: t for h, t in _failures.get(ip, {}).items() if now - t < LOCK_SECONDS}
+    _failures[ip] = tries
+    return tries
+
+
+def _record_wrong(ip: str, given: str):
+    # The same wrong code sent by several requests at once counts as one try.
+    import hashlib
+    _wrong(ip)[hashlib.sha256(given.encode()).hexdigest()] = time.time()
+
+
+def _locked(ip: str) -> bool:
+    return len(_wrong(ip)) >= MAX_TRIES
+
+
 @app.middleware("http")
 async def require_passcode(request: Request, call_next):
     path = request.url.path
     if request.method == "OPTIONS" or not path.startswith("/api") or path in OPEN_PATHS or not os.getenv("DASHBOARD_PASSCODE"):
         return await call_next(request)
-    ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "?").split(",")[0].strip()
-    recent = [t for t in _failures.get(ip, []) if time.time() - t < 600]
-    _failures[ip] = recent
-    if len(recent) >= 10:
+    ip = _client_ip(request)
+    given = request.headers.get("x-passcode") or request.query_params.get("k")
+    if _locked(ip):
         return JSONResponse({"detail": "Too many wrong passcodes. Try again in 10 minutes."}, status_code=429,
                             headers={"Access-Control-Allow-Origin": "*"})
-    if _passcode_ok(request.headers.get("x-passcode") or request.query_params.get("k")):
+    if _passcode_ok(given):
         return await call_next(request)
-    recent.append(time.time())
+    if given:                       # a missing passcode is not a wrong attempt
+        _record_wrong(ip, given)
     return JSONResponse({"detail": "Passcode required"}, status_code=401, headers={"Access-Control-Allow-Origin": "*"})
 
 
@@ -70,16 +93,20 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 @app.post("/api/auth/check")
 async def auth_check(request: Request):
     """Lets the passcode screen test a code. Counts toward the same wrong-attempt limit."""
-    ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "?").split(",")[0].strip()
-    recent = [t for t in _failures.get(ip, []) if time.time() - t < 600]
-    if len(recent) >= 10:
+    ip = _client_ip(request)
+    if _locked(ip):
         raise HTTPException(429, "Too many wrong passcodes. Try again in 10 minutes.")
-    if _passcode_ok(request.headers.get("x-passcode")):
-        _failures[ip] = []
+    given = (request.headers.get("x-passcode") or "").strip()
+    if _passcode_ok(given):
+        _failures.pop(ip, None)
         return {"ok": True, "required": bool(os.getenv("DASHBOARD_PASSCODE"))}
-    recent.append(time.time())
-    _failures[ip] = recent
-    raise HTTPException(401, "That passcode didn't match.")
+    if not given:
+        raise HTTPException(401, "Enter the passcode.")
+    _record_wrong(ip, given)
+    left = MAX_TRIES - len(_wrong(ip))
+    if left <= 0:
+        raise HTTPException(429, "Too many wrong passcodes. Try again in 10 minutes.")
+    raise HTTPException(401, f"That passcode didn't match. {left} {'try' if left == 1 else 'tries'} left.")
 
 PET_ID_MAP = {"PET-4bb19424-5bff-430a-a82d-58121d25838f": "Guava"}
 LYCHEE_ID_SUFFIX = "2219d03e"
