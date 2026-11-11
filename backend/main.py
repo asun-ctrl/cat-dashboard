@@ -28,7 +28,58 @@ from timeutil import (days_back, iso_utc, local_date, local_midnight_utc,  # noq
 init_db()
 
 app = FastAPI(title="Cat Health Monitor")
+# ── Passcode ─────────────────────────────────────────────────────────────────
+# If DASHBOARD_PASSCODE is set, every /api call needs it, sent as the X-Passcode
+# header (or ?k= for images and downloads, which can't send headers).
+import hmac  # noqa: E402
+import time  # noqa: E402
+from fastapi import Request  # noqa: E402
+from fastapi.responses import JSONResponse  # noqa: E402
+
+OPEN_PATHS = {"/api/health", "/api/auth/check"}
+_failures: dict = {}
+
+
+def _passcode_ok(given: Optional[str]) -> bool:
+    code = os.getenv("DASHBOARD_PASSCODE")
+    if not code:
+        return True
+    return bool(given) and hmac.compare_digest(given.strip().encode(), code.strip().encode())
+
+
+@app.middleware("http")
+async def require_passcode(request: Request, call_next):
+    path = request.url.path
+    if request.method == "OPTIONS" or not path.startswith("/api") or path in OPEN_PATHS or not os.getenv("DASHBOARD_PASSCODE"):
+        return await call_next(request)
+    ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "?").split(",")[0].strip()
+    recent = [t for t in _failures.get(ip, []) if time.time() - t < 600]
+    _failures[ip] = recent
+    if len(recent) >= 10:
+        return JSONResponse({"detail": "Too many wrong passcodes. Try again in 10 minutes."}, status_code=429,
+                            headers={"Access-Control-Allow-Origin": "*"})
+    if _passcode_ok(request.headers.get("x-passcode") or request.query_params.get("k")):
+        return await call_next(request)
+    recent.append(time.time())
+    return JSONResponse({"detail": "Passcode required"}, status_code=401, headers={"Access-Control-Allow-Origin": "*"})
+
+
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+
+@app.post("/api/auth/check")
+async def auth_check(request: Request):
+    """Lets the passcode screen test a code. Counts toward the same wrong-attempt limit."""
+    ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "?").split(",")[0].strip()
+    recent = [t for t in _failures.get(ip, []) if time.time() - t < 600]
+    if len(recent) >= 10:
+        raise HTTPException(429, "Too many wrong passcodes. Try again in 10 minutes.")
+    if _passcode_ok(request.headers.get("x-passcode")):
+        _failures[ip] = []
+        return {"ok": True, "required": bool(os.getenv("DASHBOARD_PASSCODE"))}
+    recent.append(time.time())
+    _failures[ip] = recent
+    raise HTTPException(401, "That passcode didn't match.")
 
 PET_ID_MAP = {"PET-4bb19424-5bff-430a-a82d-58121d25838f": "Guava"}
 LYCHEE_ID_SUFFIX = "2219d03e"

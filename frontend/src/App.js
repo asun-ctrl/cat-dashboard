@@ -1,12 +1,43 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import './styles.css';
-import { CATS, catVars, fmt, http } from './lib';
+import { CATS, catVars, fmt, getPasscode, http, setPasscode } from './lib';
 import Hero from './components/Hero';
 import Findings from './components/Findings';
 import { DurationChart, EatingBlock, RhythmChart, TripsChart, WaterBlock, WeightChart } from './components/Charts';
 import CheckIn from './components/CheckIn';
 import { AlertsPanel, PetlibroPanel, QualityPanel, RobotPanel } from './components/Backstage';
 import VisitLog from './components/VisitLog';
+
+function PasscodeScreen({ onUnlock }) {
+  const [code, setCode] = useState('');
+  const [err, setErr] = useState('');
+  const [busy, setBusy] = useState(false);
+  const submit = async e => {
+    e.preventDefault();
+    setBusy(true); setErr('');
+    try {
+      await http.post('/auth/check', null, { headers: { 'X-Passcode': code } });
+      setPasscode(code);
+      onUnlock();
+    } catch (ex) {
+      setErr(ex.response?.data?.detail || "Can't reach the dashboard. Check your connection.");
+    }
+    setBusy(false);
+  };
+  return (
+    <div className="lock">
+      <form className="lock-card" onSubmit={submit}>
+        <div className="brand">Lychee <span className="amp">&amp;</span> Guava</div>
+        <label htmlFor="pc" className="lock-label">Enter the passcode</label>
+        <input id="pc" className="lock-input" type="password" inputMode="text" autoComplete="current-password"
+               autoFocus value={code} onChange={e => setCode(e.target.value)} />
+        {err && <p className="lock-err" role="alert">{err}</p>}
+        <button className="btn lock-btn" disabled={!code || busy}>{busy ? 'Checking…' : 'Open dashboard'}</button>
+        <p className="lock-note">You only need to do this once on each device.</p>
+      </form>
+    </div>
+  );
+}
 
 export default function App() {
   const [insights, setInsights] = useState(null);
@@ -22,6 +53,7 @@ export default function App() {
   const [offline, setOffline] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
+  const [locked, setLocked] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -35,9 +67,15 @@ export default function App() {
       setSync(st.data); setAlerts(al.data); setQuality(q.data); setObservations(ob.data);
       setOffline(false);
       setRefreshKey(k => k + 1);
-    } catch {
-      setOffline(true);
+    } catch (e) {
+      if (e.response?.status !== 401) setOffline(true);
     }
+  }, []);
+
+  useEffect(() => {
+    const onLock = () => { setPasscode(''); setLocked(true); };
+    window.addEventListener('lg-locked', onLock);
+    return () => window.removeEventListener('lg-locked', onLock);
   }, []);
 
   useEffect(() => {
@@ -52,6 +90,8 @@ export default function App() {
     await load();
     setSyncing(false);
   };
+
+  if (locked) return <PasscodeScreen onUnlock={() => { setLocked(false); load(); }} />;
 
   const byCat = Object.fromEntries((insights?.cats || []).map(c => [c.cat, c]));
   const cur = byCat[selected];

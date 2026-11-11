@@ -4,6 +4,24 @@ export const API = process.env.REACT_APP_API_URL || 'http://localhost:8000/api';
 export const ORIGIN = API.replace(/\/api\/?$/, '');
 export const http = axios.create({ baseURL: API, timeout: 30000 });
 
+// Passcode: saved on this device after the first successful entry.
+const KEY = 'lg-passcode';
+export const getPasscode = () => { try { return localStorage.getItem(KEY) || ''; } catch { return ''; } };
+export const setPasscode = v => { try { v ? localStorage.setItem(KEY, v) : localStorage.removeItem(KEY); } catch {} };
+export const withCode = url => { const k = getPasscode(); return k ? `${url}${url.includes('?') ? '&' : '?'}k=${encodeURIComponent(k)}` : url; };
+
+http.interceptors.request.use(cfg => {
+  const k = getPasscode();
+  if (k) cfg.headers['X-Passcode'] = k;
+  return cfg;
+});
+http.interceptors.response.use(r => r, err => {
+  if (err.response?.status === 401 && !err.config.url.includes('/auth/check')) {
+    window.dispatchEvent(new Event('lg-locked'));
+  }
+  return Promise.reject(err);
+});
+
 export const CATS = ['Lychee', 'Guava'];
 export const CAT_COLOR = { Lychee: '#5A54C8', Guava: '#E0607E' };
 export const CAT_SOFT = { Lychee: '#ECEBFA', Guava: '#FCEAEF' };
@@ -34,6 +52,6 @@ export const ago = s => {
 
 export const photoSrc = profile => {
   if (!profile) return null;
-  if (profile.photo) return `${ORIGIN}${profile.photo}`;
+  if (profile.photo) return withCode(`${ORIGIN}${profile.photo}`);
   return profile.whisker_photo || null;
 };

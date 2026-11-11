@@ -228,3 +228,15 @@ a { color: inherit; }
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; }
 }
+
+/* ── Passcode screen ─────────────────────────────────────────────────────── */
+.lock { min-height: 100vh; display: grid; place-items: center; padding: 24px; }
+.lock-card { background: var(--paper); border: 1px solid var(--line-soft); border-radius: var(--r-lg); padding: 32px 28px; width: 100%; max-width: 360px; display: grid; gap: 12px; }
+.lock-card .brand { font-size: 26px; margin-bottom: 10px; }
+.lock-label { font-weight: 700; font-size: 15px; }
+.lock-input { border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; font-size: 17px; background: var(--mist); }
+.lock-input:focus { outline: 3px solid var(--lychee); outline-offset: 1px; background: var(--paper); }
+.lock-btn { padding: 12px; font-size: 16px; background: var(--ink); color: var(--paper); border-color: var(--ink); }
+.lock-btn:hover { border-color: var(--ink); opacity: .92; }
+.lock-err { color: var(--concern); font-size: 14px; font-weight: 700; }
+.lock-note { color: var(--ink-3); font-size: 13px; }
