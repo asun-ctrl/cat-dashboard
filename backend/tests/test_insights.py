@@ -101,3 +101,18 @@ def test_eating_drop_and_drinking_rise():
     assert f["eating"]["level"] == "concern" and "less" in f["eating"]["title"]
     assert f["water"]["level"] == "watch" and "more" in f["water"]["title"]
     assert "him" in f["eating"]["why"] and c["status"] == "concern"
+
+def test_drinking_and_peeing_together():
+    rows, i = make_rows(now=NOW, days=40)
+    for d in range(1, 8):
+        for k in range(2):
+            i += 1
+            rows.append(SimpleNamespace(id=i, cat_name="Guava", pet_id=None, timestamp=NOW - timedelta(days=d, hours=k * 5 + 2, minutes=10),
+                waste_type="Urine", duration_seconds=60, weight_grams=900, waste_weight_grams=40.0))
+    from timeutil import local_date
+    today = local_date(NOW)
+    fs = {"Guava": {str(today - timedelta(days=n)): {"eat_sessions": 20, "eat_seconds": 1600, "drinks": 9,
+          "drink_ml": 95 if n <= 7 else 72, "drink_seconds": 200, "meals": 2, "portions": 5} for n in range(1, 31)}}
+    c = {x["cat"]: x for x in build_insights(assess(rows), {}, {}, [], now=NOW, feeder_stats=fs)["cats"]}["Guava"]
+    f = {x["id"]: x for x in c["findings"]}
+    assert "pu_pd" in f and f["pu_pd"]["level"] == "watch"

@@ -472,6 +472,26 @@ def build_insights(visits: list[Assessed], profiles: dict, weight_history: dict,
                 "action": action, "sources": ["baseline"],
             })
 
+        # ── Drinking and peeing together ────────────────────────────────────
+        wv, uv = vitals.get("water") or {}, vitals.get("urine") or {}
+        if wv.get("baseline") and uv.get("baseline") and wv["baseline"] > 0 and uv["baseline"] > 0:
+            w_up = wv["value"] / wv["baseline"]
+            u_up = uv["value"] / uv["baseline"]
+            if w_up >= 1.15 and u_up >= 1.25:
+                findings.append({
+                    "id": "pu_pd", "topic": "Drinking and peeing", "level": "watch",
+                    "title": f"{cat} is drinking and peeing more than a few weeks ago",
+                    "detail": (f"Water is up {round((w_up - 1) * 100)}% ({wv['baseline']} to {wv['value']} mL a day) and pee "
+                               f"visits are up {round((u_up - 1) * 100)}% ({uv['baseline']} to {uv['value']} a day). Each change "
+                               "is small on its own, but they're moving together."),
+                    "why": ("More drinking and more peeing together is the pattern vets look for with kidney disease, "
+                            "diabetes, an overactive thyroid, or a urinary infection. It can also be harmless, like warmer "
+                            "weather or less wet food. A simple urine test and blood panel tell the difference."),
+                    "action": ("No emergency. Keep the diet steady for a week and see if it continues. If it does, book a vet "
+                               "visit and ask for a urinalysis and bloodwork. Show them this chart."),
+                    "sources": ["baseline", "pee"],
+                })
+
         # ── Data confidence ─────────────────────────────────────────────────
         month = [v for v in visits if v.ts >= now - timedelta(days=30)]
         tagged = sum(1 for v in month if v.cat == cat)
