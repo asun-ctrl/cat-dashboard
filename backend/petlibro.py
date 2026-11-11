@@ -249,6 +249,31 @@ def daily_stats(db, days: int = 60) -> dict:
     return out
 
 
+def events(db, since: datetime, until: Optional[datetime] = None) -> list[dict]:
+    """Per-event eating, drinking and meal records with the cat resolved."""
+    devs = {d.sn: d for d in db.query(PetlibroDevice).all()}
+    q = db.query(PetlibroEvent).filter(PetlibroEvent.timestamp >= since,
+                                       PetlibroEvent.type.in_(["DETECTION_EVENT", "DRINK", "GRAIN_OUTPUT_SUCCESS"]))
+    if until:
+        q = q.filter(PetlibroEvent.timestamp < until)
+    out = []
+    for e in q.all():
+        d = json.loads(e.data or "{}")
+        dev = devs.get(e.device_sn)
+        cat = d.get("petName") if d.get("petName") in CATS else (dev.cat if dev else None)
+        if not cat:
+            continue
+        if e.type == "DETECTION_EVENT":
+            out.append({"ts": e.timestamp, "cat": cat, "kind": "eat", "seconds": _seconds_from(d.get("content")) or 0})
+        elif e.type == "DRINK":
+            out.append({"ts": e.timestamp, "cat": cat, "kind": "drink", "seconds": d.get("drinkTime") or 0,
+                        "ml": d.get("totalMl") or 0})
+        else:
+            out.append({"ts": e.timestamp, "cat": cat, "kind": "meal", "portions": d.get("actualGrainNum") or 0})
+    out.sort(key=lambda x: x["ts"])
+    return out
+
+
 def last_seen(db) -> dict:
     """Most recent eating and drinking event per cat (UTC naive)."""
     devs = {d.sn: d for d in db.query(PetlibroDevice).all()}

@@ -23,9 +23,11 @@ http.interceptors.response.use(r => r, err => {
 });
 
 export const CATS = ['Lychee', 'Guava'];
-export const CAT_COLOR = { Lychee: '#5A54C8', Guava: '#E0607E' };
-export const CAT_SOFT = { Lychee: '#ECEBFA', Guava: '#FCEAEF' };
-export const catVars = cat => ({ '--cat': CAT_COLOR[cat] || '#7F869A', '--cat-soft': CAT_SOFT[cat] || '#E8ECF2' });
+const SLUG = { Lychee: 'lychee', Guava: 'guava' };
+export const catVars = cat => (SLUG[cat]
+  ? { '--cat': `var(--${SLUG[cat]})`, '--cat-soft': `var(--${SLUG[cat]}-soft)` }
+  : { '--cat': 'var(--ink-3)', '--cat-soft': 'var(--surface-2)' });
+export const catColor = cat => (SLUG[cat] ? `var(--${SLUG[cat]})` : 'var(--ink-3)');
 
 // Day-only strings ("2026-11-09") parse as UTC midnight, which shows as the
 // previous day in US time zones. Treat them as local dates.
@@ -53,5 +55,9 @@ export const ago = s => {
 export const photoSrc = profile => {
   if (!profile) return null;
   if (profile.photo) return withCode(`${ORIGIN}${profile.photo}`);
-  return profile.whisker_photo || null;
+  return null;
 };
+
+export const todayStr = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
+export const localDay = s => { const d = toDate(s); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
+export const mins = sec => { if (sec == null) return '--'; const m = sec / 60; return m >= 10 ? Math.round(m) : Math.round(m * 10) / 10; };

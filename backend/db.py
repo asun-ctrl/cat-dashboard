@@ -55,6 +55,9 @@ class VisitOverride(Base):
     assign_to = Column(String, nullable=True)
     note = Column(String, nullable=True)
     created_at = Column(DateTime)
+    whisker_status = Column(String, nullable=True)     # sending | sent | failed | skipped
+    whisker_prev_pet = Column(String, nullable=True)   # pet id the robot had before our correction
+    whisker_prev_cat = Column(String, nullable=True)
 
 
 class PetProfile(Base):
@@ -135,6 +138,17 @@ class PetlibroEvent(Base):
     __table_args__ = (UniqueConstraint("device_sn", "timestamp", "type", name="uq_pl_event"),)
 
 
+class Note(Base):
+    """Something that happened, pinned to a day: diet change, medication, vet visit."""
+    __tablename__ = "notes"
+    id = Column(Integer, primary_key=True)
+    cat = Column(String, nullable=True, index=True)   # None means both cats
+    kind = Column(String)                              # diet | med | vet | other
+    text = Column(String)
+    day = Column(String, index=True)                   # local date YYYY-MM-DD
+    created_at = Column(DateTime)
+
+
 class RobotStatus(Base):
     __tablename__ = "robot_status"
     id = Column(Integer, primary_key=True, index=True)
@@ -173,3 +187,7 @@ def init_db():
         for name, ddl in (("pet_id", "VARCHAR"), ("event_id", "VARCHAR"), ("raw_json", "TEXT")):
             if name not in cols:
                 conn.execute(text(f"ALTER TABLE litter_visits ADD COLUMN {name} {ddl}"))
+        ocols = {c["name"] for c in insp.get_columns("visit_overrides")}
+        for name in ("whisker_status", "whisker_prev_pet", "whisker_prev_cat"):
+            if name not in ocols:
+                conn.execute(text(f"ALTER TABLE visit_overrides ADD COLUMN {name} VARCHAR"))

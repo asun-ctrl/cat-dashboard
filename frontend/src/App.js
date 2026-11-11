@@ -1,12 +1,12 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import './styles.css';
-import { CATS, catVars, fmt, getPasscode, http, setPasscode } from './lib';
-import Hero from './components/Hero';
-import Findings from './components/Findings';
-import { DurationChart, EatingBlock, RhythmChart, TripsChart, WaterBlock, WeightChart } from './components/Charts';
-import CheckIn from './components/CheckIn';
-import { AlertsPanel, PetlibroPanel, QualityPanel, RobotPanel } from './components/Backstage';
-import VisitLog from './components/VisitLog';
+import { CATS, getPasscode, http, setPasscode } from './lib';
+import { Icon, Sheet } from './components/Bits';
+import Today from './components/Today';
+import Trends from './components/Trends';
+import Week from './components/Week';
+import Journal, { LogForm } from './components/Journal';
+import More, { Report } from './components/More';
 
 function PasscodeScreen({ onUnlock }) {
   const [code, setCode] = useState('');
@@ -28,43 +28,53 @@ function PasscodeScreen({ onUnlock }) {
     <div className="lock">
       <form className="lock-card" onSubmit={submit}>
         <div className="brand">Lychee <span className="amp">&amp;</span> Guava</div>
-        <label htmlFor="pc" className="lock-label">Enter the passcode</label>
-        <input id="pc" className="lock-input" type="password" inputMode="text" autoComplete="current-password"
-               autoFocus value={code} onChange={e => setCode(e.target.value)} />
+        <label htmlFor="pc" className="field-label">Enter the passcode</label>
+        <input id="pc" className="input" type="password" autoComplete="current-password" autoFocus value={code} onChange={e => setCode(e.target.value)} />
         {err && <p className="lock-err" role="alert">{err}</p>}
-        <button className="btn lock-btn" disabled={!code || busy}>{busy ? 'Checking…' : 'Open dashboard'}</button>
-        <p className="lock-note">You only need to do this once on each device.</p>
+        <button className="btn-primary" style={{ marginTop: 4 }} disabled={!code || busy}>{busy ? 'Checking…' : 'Open dashboard'}</button>
+        <p className="muted">You only need to do this once on each device.</p>
       </form>
     </div>
   );
 }
 
+const TABS = [['today', 'Today', 'home'], ['trends', 'Trends', 'chart'], ['week', 'Week', 'week'], ['journal', 'Journal', 'journal'], ['more', 'More', 'more']];
+const startTab = () => { const h = window.location.hash.slice(1); return TABS.some(t => t[0] === h) || h === 'report' ? h : 'today'; };
+
 export default function App() {
-  const [insights, setInsights] = useState(null);
-  const [summary, setSummary] = useState(null);
-  const [pets, setPets] = useState({});
-  const [robot, setRobot] = useState(null);
-  const [sync, setSync] = useState(null);
-  const [alerts, setAlerts] = useState(null);
-  const [quality, setQuality] = useState(null);
-  const [observations, setObservations] = useState([]);
-  const [petlibro, setPetlibro] = useState(null);
-  const [selected, setSelected] = useState(CATS[1]);
+  const [d, setD] = useState(null);
+  const [tab, setTabState] = useState(startTab);
+  const [cat, setCat] = useState(CATS[1]);
   const [offline, setOffline] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
   const [locked, setLocked] = useState(false);
+  const [sheet, setSheet] = useState(null);
+  const [toastMsg, setToastMsg] = useState('');
+  const toastTimer = useRef();
+
+  const toast = useCallback(msg => {
+    setToastMsg(msg);
+    clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToastMsg(''), 2600);
+  }, []);
+
+  const setTab = useCallback(t => {
+    setTabState(t);
+    window.history.replaceState(null, '', `#${t}`);
+    window.scrollTo(0, 0);
+  }, []);
 
   const load = useCallback(async () => {
     try {
-      const [ins, sum, pt, rs, st, al, q, ob] = await Promise.all([
-        http.get('/insights'), http.get('/litter/summary'), http.get('/pets'), http.get('/robot/status'),
-        http.get('/sync/status'), http.get('/alerts', { params: { limit: 6 } }), http.get('/quality'),
-        http.get('/observations', { params: { days: 30 } }),
+      const get = (url, params) => http.get(url, { params }).then(r => r.data);
+      const soft = (url, params, fallback) => get(url, params).catch(e => { if (e.response?.status === 401) throw e; return fallback; });
+      const [insights, summary, pets, robot, sync, alerts, quality, observations, notes, feed, petlibro] = await Promise.all([
+        get('/insights'), get('/litter/summary'), get('/pets'), soft('/robot/status', null, null), soft('/sync/status', null, null),
+        soft('/alerts', { limit: 12 }, null), soft('/quality', null, null), soft('/observations', { days: 120 }, []),
+        soft('/notes', null, []), soft('/feed', { hours: 48 }, []), soft('/petlibro', null, null),
       ]);
-      http.get('/petlibro').then(r => setPetlibro(r.data)).catch(() => {});
-      setInsights(ins.data); setSummary(sum.data); setPets(pt.data); setRobot(rs.data);
-      setSync(st.data); setAlerts(al.data); setQuality(q.data); setObservations(ob.data);
+      setD({ insights, summary, pets, robot, sync, alerts, quality, observations, notes, feed, petlibro });
       setOffline(false);
       setRefreshKey(k => k + 1);
     } catch (e) {
@@ -81,7 +91,9 @@ export default function App() {
   useEffect(() => {
     load();
     const t = setInterval(load, 120000);
-    return () => clearInterval(t);
+    const wake = () => document.visibilityState === 'visible' && load();
+    document.addEventListener('visibilitychange', wake);
+    return () => { clearInterval(t); document.removeEventListener('visibilitychange', wake); };
   }, [load]);
 
   const refresh = async () => {
@@ -89,108 +101,57 @@ export default function App() {
     try { await http.post('/sync'); } catch {}
     await load();
     setSyncing(false);
+    toast('Up to date');
   };
 
   if (locked) return <PasscodeScreen onUnlock={() => { setLocked(false); load(); }} />;
 
-  const byCat = Object.fromEntries((insights?.cats || []).map(c => [c.cat, c]));
-  const cur = byCat[selected];
-  const s = summary?.[selected];
+  const attention = d ? d.insights.cats.some(c => c.status === 'watch' || c.status === 'concern') : false;
+  const openCat = c => { setCat(c); setTab('trends'); };
+  const shown = tab === 'report' ? 'more' : tab;
 
   return (
-    <div className="page">
-      <header className="topbar">
-        <div className="brand">Lychee <span className="amp">&amp;</span> Guava</div>
-        <div className="topbar-right">
-          {offline ? <span className="offline">Can't reach the dashboard server.</span>
-                   : sync?.last_sync && <span>Updated {fmt.clock(sync.last_sync)}</span>}
-          <button className="btn" onClick={refresh} disabled={syncing}>{syncing ? 'Checking the robot…' : 'Check for new visits'}</button>
-        </div>
-      </header>
-
-      {!insights ? (
-        <div className="heroes"><div className="skeleton" /><div className="skeleton" /></div>
+    <div className="app">
+      {offline && <p className="offline" role="alert">Can't reach the dashboard server. Showing the last data loaded.</p>}
+      {!d ? (
+        <>{!offline && <><div className="skeleton" style={{ height: 60 }} /><div className="skeleton" style={{ marginTop: 14 }} /><div className="skeleton" style={{ marginTop: 14 }} /></>}
+          {offline && !getPasscode() && <button className="btn-secondary" style={{ marginTop: 12 }} onClick={load}>Try again</button>}</>
       ) : (
-        <div className="heroes">
-          {CATS.map(cat => byCat[cat] && (
-            <Hero key={cat} data={byCat[cat]} profile={pets[cat]} active={selected === cat}
-                  onSelect={c => { setSelected(c); }} onPhoto={load} />
+        <main key={tab}>
+          {tab === 'today' && <Today d={d} onOpenCat={openCat} refresh={refresh} syncing={syncing} />}
+          {tab === 'trends' && <Trends d={d} cat={cat} setCat={setCat} />}
+          {tab === 'week' && <Week pets={d.pets} />}
+          {tab === 'journal' && <Journal d={d} reload={load} refreshKey={refreshKey} toast={toast} />}
+          {tab === 'more' && <More d={d} reload={load} toast={toast} openReport={() => setTab('report')} />}
+          {tab === 'report' && <Report startCat={cat} onBack={() => setTab('more')} toast={toast} />}
+        </main>
+      )}
+
+      {d && tab !== 'report' && tab !== 'journal' && (
+        <button className="fab" onClick={() => setSheet('checkin')} aria-label="Log something"><Icon name="plus" /></button>
+      )}
+
+      <nav className="tabbar" aria-label="Sections">
+        <div className="tabbar-inner">
+          {TABS.map(([id, label, icon]) => (
+            <button key={id} className="tab" aria-current={shown === id ? 'page' : undefined} onClick={() => setTab(id)}>
+              <span className="tab-ico"><Icon name={icon} />{id === 'today' && attention && shown !== 'today' && <span className="tab-dot" />}</span>
+              {label}
+            </button>
           ))}
         </div>
+      </nav>
+
+      {sheet && (
+        <Sheet title="Log something" onClose={() => setSheet(null)}>
+          <div className="seg" role="group" aria-label="What to log" style={{ marginTop: 12 }}>
+            <button aria-pressed={sheet === 'checkin'} onClick={() => setSheet('checkin')}>Box check</button>
+            <button aria-pressed={sheet === 'note'} onClick={() => setSheet('note')}>Note</button>
+          </div>
+          <LogForm key={sheet} mode={sheet} defaultCat={cat} toast={toast} onSaved={() => { setSheet(null); load(); }} />
+        </Sheet>
       )}
-
-      {insights && (
-        <details className="emergency">
-          <summary>
-            <span>When to call a vet right away</span>
-            <span style={{ color: 'var(--ink-2)', fontWeight: 400 }}>Show</span>
-          </summary>
-          <ul>{insights.emergency.map(e => <li key={e}>{e}</li>)}</ul>
-        </details>
-      )}
-
-      {cur && (
-        <section style={catVars(selected)}>
-          <div className="section-head">
-            <div>
-              <h2 className="section-title">A closer look at {selected}</h2>
-              <p className="section-sub">What the robot's numbers mean, in plain terms. Switch cats here or by tapping a photo above.</p>
-            </div>
-            <div className="cat-tabs" role="tablist" aria-label="Choose a cat">
-              {CATS.map(c => (
-                <button key={c} role="tab" className="cat-tab" aria-selected={selected === c} style={catVars(c)} onClick={() => setSelected(c)}>
-                  <span className="dot" />{c}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <div className="detail">
-            <div>
-              <Findings cat={selected} findings={cur.findings} sources={insights.sources} />
-              <CheckIn cat={selected} observations={observations} onChange={load} />
-            </div>
-            <div className="panel">
-              <WeightChart cat={selected} trend={s?.weight_trend} vital={cur.vitals?.weight} />
-              <EatingBlock cat={selected} data={petlibro?.cats?.[selected]} />
-              <WaterBlock cat={selected} data={petlibro?.cats?.[selected]} vital={cur.vitals?.water} />
-              <TripsChart cat={selected} week={s?.week_trend} month={s?.month_trend} year={s?.year_trend} />
-              <RhythmChart cat={selected} hours={s?.hour_pattern} daysTracked={s?.averages?.days_tracked}
-                           feedingTimes={insights.meal_times?.[selected] || insights.feeding_times} afterMeal={cur.vitals?.after_meal} />
-              <DurationChart cat={selected} trend={s?.duration_trend} vital={cur.vitals?.duration} />
-            </div>
-          </div>
-        </section>
-      )}
-
-      {insights && (
-        <>
-          <div className="section-head">
-            <div>
-              <h2 className="section-title">Behind the scenes</h2>
-              <p className="section-sub">The robot, alerts, and how odd readings were handled.</p>
-            </div>
-          </div>
-          <div className="backstage">
-            <RobotPanel robot={robot} sync={sync} />
-            <PetlibroPanel data={petlibro} status={sync?.petlibro} />
-            <AlertsPanel data={alerts} />
-            <QualityPanel q={quality} />
-          </div>
-          <div style={{ marginTop: 20 }}>
-            <VisitLog refreshKey={refreshKey} onChanged={load} />
-          </div>
-
-          <footer className="footer">
-            <p>{insights.disclaimer}</p>
-            <ul>
-              {Object.values(insights.sources).map(src => (
-                <li key={src.url}><a href={src.url} target="_blank" rel="noreferrer">{src.label}</a></li>
-              ))}
-            </ul>
-          </footer>
-        </>
-      )}
+      {toastMsg && <div className="toast" role="status">{toastMsg}</div>}
     </div>
   );
 }

@@ -17,7 +17,8 @@ from pydantic import BaseModel
 load_dotenv()
 
 import alerts as alerting  # noqa: E402
-from db import (AlertLog, LitterVisit, Observation, PetProfile, RobotStatus,  # noqa: E402
+import story as storylib  # noqa: E402
+from db import (AlertLog, LitterVisit, Note, Observation, PetProfile, RobotStatus,  # noqa: E402
                 SessionLocal, SyncLog, VisitOverride, WeightHistory, init_db, DATA_DIR)
 from insights import build_insights, possible_loose_stool  # noqa: E402
 import petlibro  # noqa: E402
@@ -257,12 +258,22 @@ async def sync_litter_robot(historical: bool = False):
                         continue
                     cat, pid = get_cat_name(ad)
                     event_id = ad.get("eventId") or ad.get("id")
-                    exists = db.query(LitterVisit).filter(
-                        LitterVisit.timestamp == ts, LitterVisit.cat_name == cat).first()
+                    exists = None
+                    if event_id:
+                        exists = db.query(LitterVisit).filter(LitterVisit.event_id == str(event_id)).first()
+                    if not exists:
+                        exists = db.query(LitterVisit).filter(
+                            LitterVisit.timestamp == ts, LitterVisit.cat_name == cat).first()
                     if exists:
                         if exists.raw_json is None:
                             exists.event_id = str(event_id) if event_id else None
                             exists.raw_json = json.dumps(ad, default=str)
+                        if exists.cat_name != cat and cat in CATS:
+                            # The visit was reassigned in Whisker (by us or in the app): follow it.
+                            clash = db.query(LitterVisit.id).filter(LitterVisit.timestamp == ts, LitterVisit.cat_name == cat).first()
+                            if not clash:
+                                exists.cat_name, exists.pet_id = cat, pid
+                                exists.raw_json = json.dumps(ad, default=str)
                         continue
                     db.add(LitterVisit(
                         cat_name=cat, pet_id=pid, timestamp=ts,
@@ -517,7 +528,9 @@ def get_recent_visits(limit: int = 50, flagged_only: bool = False):
         loose = set()
         for c in CATS:
             loose |= possible_loose_stool(vs, c)
-        return [visit_json(v, loose) for v in vs[:max(1, min(limit, 500))]]
+        vs = vs[:max(1, min(limit, 500))]
+        wstat = {o.visit_id: o.whisker_status for o in db.query(VisitOverride).all()}
+        return [{**visit_json(v, loose), "whisker": wstat.get(v.id)} for v in vs]
     finally:
         db.close()
 
@@ -541,8 +554,82 @@ class OverrideIn(BaseModel):
     note: Optional[str] = None
 
 
+# Corrections go back to Whisker so the robot's own records and weight history improve.
+WHISKER_WRITEBACK = os.getenv("WHISKER_WRITEBACK", "1") == "1"
+_writeback_lock = asyncio.Lock()
+
+
+async def _whisker_robot(serial: Optional[str] = None):
+    """Connect and return (account, robot). Separate so tests can replace it."""
+    from pylitterbot import Account, LitterRobot5
+    account = Account(robot_types=[LitterRobot5])
+    await account.connect(username=os.getenv("WHISKER_EMAIL"), password=os.getenv("WHISKER_PASSWORD"), load_robots=True)
+    robots = account.robots
+    robot = next((r for r in robots if serial and getattr(r, "serial", None) == serial), robots[0] if robots else None)
+    return account, robot
+
+
+async def whisker_reassign(visit_id: int, to_cat: Optional[str], undo: bool = False, prev_pet: Optional[str] = None,
+                           prev_cat: Optional[str] = None):
+    """Tell Whisker which cat a visit belongs to. `undo` puts back what the robot had."""
+    async with _writeback_lock:
+        db = SessionLocal()
+        account = None
+        try:
+            v = db.get(LitterVisit, visit_id)
+            o = db.query(VisitOverride).filter(VisitOverride.visit_id == visit_id).first()
+
+            def mark(status):
+                if o and not undo:
+                    o.whisker_status = status
+                    db.commit()
+
+            if not v or not v.event_id:
+                return mark("skipped")
+            if undo:
+                from_pid, to_pid, new_cat = v.pet_id, prev_pet, prev_cat or "Unknown"
+            else:
+                prof = db.get(PetProfile, to_cat)
+                from_pid, to_pid, new_cat = v.pet_id, (prof.pet_id if prof else None), to_cat
+                if not to_pid:
+                    return mark("skipped")
+            if from_pid == to_pid:
+                return mark("sent")
+            serial = (json.loads(v.raw_json or "{}") or {}).get("serial")
+            account, robot = await _whisker_robot(serial)
+            if robot is None:
+                return mark("failed")
+            res = await robot.reassign_pet_visit(v.event_id, from_pet_id=from_pid, to_pet_id=to_pid)
+            if res is None:
+                return mark("failed")
+            if o and not undo:
+                o.whisker_prev_pet, o.whisker_prev_cat = from_pid, v.cat_name
+            clash = db.query(LitterVisit.id).filter(LitterVisit.timestamp == v.timestamp, LitterVisit.cat_name == new_cat,
+                                                    LitterVisit.id != v.id).first()
+            if not clash:
+                v.cat_name, v.pet_id = new_cat, to_pid
+            db.commit()
+            mark("sent")
+        except Exception as e:
+            print(f"[WHISKER] reassign failed: {e}")
+            db.rollback()
+            try:
+                if o and not undo:
+                    o.whisker_status = "failed"
+                    db.commit()
+            except Exception:
+                db.rollback()
+        finally:
+            if account is not None:
+                try:
+                    await account.disconnect()
+                except Exception:
+                    pass
+            db.close()
+
+
 @app.post("/api/visits/{visit_id}/override")
-def set_override(visit_id: int, body: OverrideIn):
+async def set_override(visit_id: int, body: OverrideIn):
     if body.action not in ("exclude", "include", "assign"):
         raise HTTPException(400, "action must be exclude, include, or assign")
     if body.action == "assign" and body.assign_to not in CATS:
@@ -553,22 +640,31 @@ def set_override(visit_id: int, body: OverrideIn):
             raise HTTPException(404, "visit not found")
         o = db.query(VisitOverride).filter(VisitOverride.visit_id == visit_id).first() or VisitOverride(visit_id=visit_id)
         o.action, o.assign_to, o.note, o.created_at = body.action, body.assign_to, body.note, utc_now()
+        send = body.action == "assign" and WHISKER_WRITEBACK
+        o.whisker_status = "sending" if send else None
         db.add(o)
         db.commit()
-        return {"ok": True}
     finally:
         db.close()
+    if send:
+        asyncio.create_task(whisker_reassign(visit_id, body.assign_to))
+    return {"ok": True, "whisker": "sending" if send else None}
 
 
 @app.delete("/api/visits/{visit_id}/override")
-def clear_override(visit_id: int):
+async def clear_override(visit_id: int):
     db = SessionLocal()
     try:
+        o = db.query(VisitOverride).filter(VisitOverride.visit_id == visit_id).first()
+        revert = bool(o and o.action == "assign" and o.whisker_status == "sent")
+        prev_pet, prev_cat = (o.whisker_prev_pet, o.whisker_prev_cat) if o else (None, None)
         db.query(VisitOverride).filter(VisitOverride.visit_id == visit_id).delete()
         db.commit()
-        return {"ok": True}
     finally:
         db.close()
+    if revert and WHISKER_WRITEBACK:
+        asyncio.create_task(whisker_reassign(visit_id, None, undo=True, prev_pet=prev_pet, prev_cat=prev_cat))
+    return {"ok": True}
 
 
 @app.get("/api/alerts")
@@ -787,6 +883,119 @@ def delete_observation(obs_id: int):
         db.close()
 
 
+# ── Notes, weekly story, vet report, activity feed ──────────────────────────
+
+NOTE_KINDS = {"diet", "med", "vet", "other"}
+
+
+class NoteIn(BaseModel):
+    cat: Optional[str] = None
+    kind: str = "other"
+    text: str
+    day: Optional[str] = None
+
+
+def _note_json(n):
+    return {"id": n.id, "cat": n.cat, "kind": n.kind, "text": n.text, "day": n.day}
+
+
+@app.get("/api/notes")
+def list_notes():
+    db = SessionLocal()
+    try:
+        return [_note_json(n) for n in db.query(Note).order_by(Note.day.desc(), Note.id.desc()).limit(300).all()]
+    finally:
+        db.close()
+
+
+@app.post("/api/notes")
+def add_note(body: NoteIn):
+    text_ = (body.text or "").strip()[:300]
+    if not text_ or body.kind not in NOTE_KINDS or (body.cat and body.cat not in CATS):
+        raise HTTPException(400, "A note needs some text, a valid type, and a known cat.")
+    day = body.day or str(local_date(utc_now()))
+    try:
+        from datetime import date as _date
+        _date.fromisoformat(day)
+    except ValueError:
+        raise HTTPException(400, "The date isn't valid.")
+    db = SessionLocal()
+    try:
+        n = Note(cat=body.cat or None, kind=body.kind, text=text_, day=day, created_at=utc_now())
+        db.add(n)
+        db.commit()
+        return _note_json(n)
+    finally:
+        db.close()
+
+
+@app.delete("/api/notes/{note_id}")
+def delete_note(note_id: int):
+    db = SessionLocal()
+    try:
+        db.query(Note).filter(Note.id == note_id).delete()
+        db.commit()
+        return {"ok": True}
+    finally:
+        db.close()
+
+
+def _story(db, offset: int = 0) -> dict:
+    visits = load_assessed(db, days=120)
+    since = utc_now() - timedelta(days=120)
+    return storylib.week_story(
+        visits, petlibro.daily_stats(db, days=120), _profiles(db),
+        db.query(Observation).filter(Observation.created_at >= since).all(), db.query(Note).all(),
+        db.query(AlertLog).filter(AlertLog.created_at >= since).all(), offset=max(0, min(offset, 26)))
+
+
+@app.get("/api/story")
+def get_story(offset: int = 0):
+    db = SessionLocal()
+    try:
+        return _story(db, offset)
+    finally:
+        db.close()
+
+
+@app.get("/api/report")
+def get_report(cat: str, days: int = 30):
+    if cat not in CATS:
+        raise HTTPException(404, "Unknown cat")
+    days = max(7, min(days, 90))
+    db = SessionLocal()
+    try:
+        visits = load_assessed(db, days=200)
+        since = utc_now() - timedelta(days=200)
+        obs = db.query(Observation).filter(Observation.created_at >= since).all()
+        fstats = petlibro.daily_stats(db, days=200)
+        profiles = _profiles(db)
+        ins = build_insights(visits, profiles, _weight_history(db), obs, meal_times=petlibro.meal_times(db),
+                             feeder_stats=fstats)
+        ins_cat = next((c for c in ins["cats"] if c["cat"] == cat), {})
+        return storylib.vet_report(visits, fstats, profiles.get(cat) or {}, ins_cat, obs, db.query(Note).all(),
+                                   db.query(AlertLog).filter(AlertLog.created_at >= since).all(), cat, days)
+    finally:
+        db.close()
+
+
+@app.get("/api/feed")
+def get_feed(hours: int = 36):
+    hours = max(6, min(hours, 96))
+    db = SessionLocal()
+    try:
+        since = utc_now() - timedelta(hours=hours)
+        visits = load_assessed(db, days=60)
+        loose = set()
+        for c in CATS:
+            loose |= possible_loose_stool(visits, c)
+        return storylib.activity_feed(
+            visits, petlibro.events(db, since), db.query(Observation).filter(Observation.created_at >= since).all(),
+            db.query(Note).filter(Note.created_at >= since).all(), since, frozenset(loose))
+    finally:
+        db.close()
+
+
 @app.get("/api/debug/activity-keys")
 def activity_keys():
     """Field names (not values) of the newest stored Whisker activity."""
@@ -862,6 +1071,15 @@ async def send_digest():
     await alerting.send("Daily cat summary", text, "info")
 
 
+async def send_weekly_story():
+    db = SessionLocal()
+    try:
+        s_ = _story(db, 0)
+    finally:
+        db.close()
+    await alerting.send("The week in review", storylib.story_headline(s_) + " Open the dashboard for the full story.", "info")
+
+
 @app.on_event("startup")
 async def startup_event():
     scheduler.add_job(sync_litter_robot, "interval", minutes=int(os.getenv("SYNC_MINUTES", "30")), id="litter_sync")
@@ -869,6 +1087,7 @@ async def startup_event():
     if digest_hour:
         from timeutil import TZ
         scheduler.add_job(send_digest, "cron", hour=int(digest_hour), minute=0, timezone=TZ, id="digest")
+        scheduler.add_job(send_weekly_story, "cron", day_of_week="sun", hour=18, minute=0, timezone=TZ, id="weekly_story")
     scheduler.start()
     if os.getenv("DISABLE_STARTUP_SYNC") != "1":
         asyncio.create_task(sync_litter_robot(historical=True))
