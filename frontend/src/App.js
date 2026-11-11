@@ -3,7 +3,7 @@ import './styles.css';
 import { CATS, catVars, fmt, http } from './lib';
 import Hero from './components/Hero';
 import Findings from './components/Findings';
-import { DurationChart, EatingBlock, RhythmChart, TripsChart, WeightChart } from './components/Charts';
+import { DurationChart, EatingBlock, RhythmChart, TripsChart, WaterBlock, WeightChart } from './components/Charts';
 import CheckIn from './components/CheckIn';
 import { AlertsPanel, PetlibroPanel, QualityPanel, RobotPanel } from './components/Backstage';
 import VisitLog from './components/VisitLog';
@@ -113,6 +113,7 @@ export default function App() {
             <div className="panel">
               <WeightChart cat={selected} trend={s?.weight_trend} vital={cur.vitals?.weight} />
               <EatingBlock cat={selected} data={petlibro?.cats?.[selected]} />
+              <WaterBlock cat={selected} data={petlibro?.cats?.[selected]} vital={cur.vitals?.water} />
               <TripsChart cat={selected} week={s?.week_trend} month={s?.month_trend} year={s?.year_trend} />
               <RhythmChart cat={selected} hours={s?.hour_pattern} daysTracked={s?.averages?.days_tracked}
                            feedingTimes={insights.meal_times?.[selected] || insights.feeding_times} afterMeal={cur.vitals?.after_meal} />

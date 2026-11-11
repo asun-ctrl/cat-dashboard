@@ -35,6 +35,8 @@ SOURCES = {
                   "url": "https://www.preventivevet.com/cats/what-to-do-if-your-cat-has-a-urinary-obstruction"},
     "baseline": {"label": "Rover (vet quoted): day to day variation is normal",
                  "url": "https://www.rover.com/blog/often-cats-pee/"},
+    "appetite": {"label": "VCA Animal Hospitals: hepatic lipidosis (fatty liver) in cats",
+                 "url": "https://vcahospitals.com/know-your-pet/hepatic-lipidosis-in-cats"},
 }
 
 EMERGENCY = [
@@ -66,6 +68,10 @@ def _pronouns(text: str, male: bool) -> str:
     text = re.sub(r"\bshe\b", "he", text)
     text = re.sub(r"\bher\b", "his", text)
     return text
+
+
+def pronoun_obj(pron: str) -> str:
+    return "him" if pron == "he" else "her"
 
 
 def _pct(a: float, b: float) -> float:
@@ -148,8 +154,10 @@ def possible_loose_stool(visits: list[Assessed], cat: str) -> set[int]:
 
 
 def build_insights(visits: list[Assessed], profiles: dict, weight_history: dict,
-                   observations: list, now: Optional[datetime] = None, meal_times: Optional[dict] = None) -> dict:
+                   observations: list, now: Optional[datetime] = None, meal_times: Optional[dict] = None,
+                   feeder_stats: Optional[dict] = None) -> dict:
     meal_times = meal_times or {}
+    feeder_stats = feeder_stats or {}
     now = now or utc_now()
     today = local_date(now)
     recent_days = [today - timedelta(days=i) for i in range(1, 8)]          # last 7 full days
@@ -394,6 +402,75 @@ def build_insights(visits: list[Assessed], profiles: dict, weight_history: dict,
                                "week, or any blood, is worth a vet call. Ask whether a diet trial or a fecal test makes sense."),
                     "sources": ["poop"],
                 })
+
+        # ── Eating and drinking (PetLibro) ──────────────────────────────────
+        fs = feeder_stats.get(cat, {})
+        def per_day(days, key):
+            vals = [fs[str(d)][key] for d in days if str(d) in fs]
+            return vals
+        pl_recent = [today - timedelta(days=i) for i in range(1, 8)]
+        pl_base = [today - timedelta(days=i) for i in range(8, 31)]
+        r_eat, b_eat = per_day(pl_recent, "eat_seconds"), per_day(pl_base, "eat_seconds")
+        r_ses = per_day(pl_recent, "eat_sessions")
+        if len(r_eat) >= 4:
+            re_min = mean(r_eat) / 60
+            be_min = mean(b_eat) / 60 if len(b_eat) >= 7 else None
+            vitals["eating"] = {"value": round(re_min, 1), "unit": "min a day", "baseline": round(be_min, 1) if be_min else None,
+                                "sessions": round(mean(r_ses), 1) if r_ses else None}
+            lvl, title = "good", f"{cat} is eating normally"
+            action = "Nothing to do."
+            if be_min and be_min > 0:
+                ratio = re_min / be_min
+                if ratio <= 0.5:
+                    lvl, title = "concern", f"{cat} is eating much less than usual"
+                    action = ("Call your vet. A cat that eats much less for more than a day or two can get seriously ill, "
+                              "even if it seems otherwise fine.")
+                elif ratio <= 0.7:
+                    lvl, title = "watch", f"{cat} is eating less than usual"
+                    action = ("Check the bowl and watch a meal or two. If it continues for another day or two, or "
+                              f"{pron} also seems quiet or is hiding, call your vet.")
+                elif ratio >= 1.5:
+                    lvl, title = "info", f"{cat} is spending more time eating"
+                    action = "Usually fine. Combined with weight loss or more drinking, it's worth mentioning to your vet."
+            detail = (f"About {re_min:.0f} minutes at the bowl a day over the last week, across "
+                      f"{mean(r_ses):.0f} visits a day.") if r_ses else f"About {re_min:.0f} minutes at the bowl a day."
+            if be_min:
+                detail += f" Before that it was about {be_min:.0f} minutes a day."
+            vitals["eating"]["level"] = lvl
+            findings.append({
+                "id": "eating", "topic": "Eating", "level": lvl, "title": title, "detail": detail,
+                "why": ("A drop in appetite is one of the most common early signs that a cat isn't feeling well. Cats "
+                        "that stop eating for even a few days can develop fatty liver disease, which is serious. Time "
+                        f"at the bowl comes from {poss} RFID feeder, which only opens for {pronoun_obj(pron)}."),
+                "action": action, "sources": ["appetite"],
+            })
+
+        r_ml, b_ml = per_day(pl_recent, "drink_ml"), per_day(pl_base, "drink_ml")
+        if len(r_ml) >= 4 and sum(r_ml) > 0:
+            rm_ml = mean(r_ml)
+            bm_ml = mean(b_ml) if len(b_ml) >= 7 and sum(b_ml) > 0 else None
+            vitals["water"] = {"value": round(rm_ml), "unit": "mL a day", "baseline": round(bm_ml) if bm_ml else None}
+            lvl, title, action = "good", f"{cat}'s water intake is steady", "Nothing to do."
+            if bm_ml:
+                ratio = rm_ml / bm_ml
+                if ratio >= 1.5 and rm_ml - bm_ml >= 20:
+                    lvl, title = "watch", f"{cat} is drinking more than usual"
+                    action = ("Keep an eye on it for a few days. Drinking noticeably more, especially with peeing more, "
+                              "is worth a vet visit and a simple blood and urine test.")
+                elif ratio <= 0.5:
+                    lvl, title = "watch", f"{cat} is drinking less from the fountain"
+                    action = ("Check that the fountain is full and running. If wet food hasn't changed and it continues, "
+                              "mention it to your vet.")
+            detail = f"About {rm_ml:.0f} mL a day from the fountain over the last week"
+            detail += f", compared with {bm_ml:.0f} mL before." if bm_ml else "."
+            detail += " Wet food supplies a lot of a cat's water too, so the trend matters more than the number."
+            vitals["water"]["level"] = lvl
+            findings.append({
+                "id": "water", "topic": "Drinking", "level": lvl, "title": title, "detail": detail,
+                "why": ("Drinking a lot more than usual is an early sign of kidney disease, diabetes, or an overactive "
+                        "thyroid, which are all common in cats. The RFID fountain records which cat drank and how much."),
+                "action": action, "sources": ["baseline"],
+            })
 
         # ── Data confidence ─────────────────────────────────────────────────
         month = [v for v in visits if v.ts >= now - timedelta(days=30)]

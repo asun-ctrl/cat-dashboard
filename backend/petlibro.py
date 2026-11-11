@@ -147,8 +147,6 @@ async def sync(db) -> str:
     try:
         devices = await client.post("/device/device/list") or []
         now = utc_now()
-        start = int((now - timedelta(days=7)).replace(tzinfo=timezone.utc).timestamp() * 1000)
-        end = int(now.replace(tzinfo=timezone.utc).timestamp() * 1000)
         new_events = 0
         for d in devices:
             sn = d.get("deviceSn")
@@ -177,14 +175,27 @@ async def sync(db) -> str:
                 await grab("feeding_plan_today", "/device/feedingPlan/todayNew")
             if kind == "fountain":
                 await grab("drink_today", "/data/deviceDrinkWater/todayDrinkData")
-            # Ask for every record type first; fall back to the one type known to work.
-            work = await grab("work_record", "/device/workRecord/list",
-                              {"deviceSn": sn, "startTime": start, "endTime": end, "size": 100})
-            if not work:
-                work = await grab("work_record", "/device/workRecord/list",
-                                  {"deviceSn": sn, "startTime": start, "endTime": end, "size": 100,
-                                   "type": ["GRAIN_OUTPUT_SUCCESS"]})
-            new_events += _save_events(db, sn, work)
+            # The log returns at most 100 records per request, so fetch one day at a time:
+            # 30 days back the first time, then the last 2 days on each sync.
+            backfilled = client._kv(f"petlibro_backfilled:{sn}")
+            days_back = 2 if backfilled else int(os.getenv("PETLIBRO_BACKFILL_DAYS", "30"))
+            for i in range(days_back):
+                day_end = now - timedelta(days=i)
+                day_start = day_end - timedelta(days=1)
+                body = {"deviceSn": sn, "size": 100,
+                        "startTime": int(day_start.replace(tzinfo=timezone.utc).timestamp() * 1000),
+                        "endTime": int(day_end.replace(tzinfo=timezone.utc).timestamp() * 1000)}
+                try:
+                    work = await client.post("/device/workRecord/list", body)
+                except Exception as e:
+                    print(f"[PETLIBRO] {sn} log day -{i}: {e}")
+                    continue
+                if i == 0:
+                    _save_daily(db, sn, "work_record", work)
+                new_events += _save_events(db, sn, work)
+                db.commit()
+            if not backfilled:
+                client._kv(f"petlibro_backfilled:{sn}", utc_now().isoformat())
 
             dev.cat = _match_cat(d, bound if isinstance(bound, list) else [])
             dev.online = 1 if (real or {}).get("online", d.get("online", True)) else 0
@@ -197,6 +208,79 @@ async def sync(db) -> str:
 
 
 # ── Read side ───────────────────────────────────────────────────────────────
+
+import re
+
+_DUR = re.compile(r"(?:(\d+)\s*m)?\s*(\d+)\s*s", re.I)
+
+
+def _seconds_from(text: str) -> Optional[int]:
+    """'ate for 01m20s' -> 80, 'ate for 11s' -> 11."""
+    m = _DUR.search(text or "")
+    if not m:
+        return None
+    return int(m.group(1) or 0) * 60 + int(m.group(2))
+
+
+def daily_stats(db, days: int = 60) -> dict:
+    """{cat: {local_date_str: {...}}} built from the per-event feeder and fountain log."""
+    since = utc_now() - timedelta(days=days)
+    devs = {d.sn: d for d in db.query(PetlibroDevice).all()}
+    out: dict = {}
+    for e in db.query(PetlibroEvent).filter(PetlibroEvent.timestamp >= since).all():
+        d = json.loads(e.data or "{}")
+        dev = devs.get(e.device_sn)
+        cat = d.get("petName") if d.get("petName") in CATS else (dev.cat if dev else None)
+        if not cat:
+            continue
+        day = out.setdefault(cat, {}).setdefault(str(local_date(e.timestamp)), {
+            "eat_sessions": 0, "eat_seconds": 0, "drinks": 0, "drink_ml": 0, "drink_seconds": 0,
+            "meals": 0, "portions": 0})
+        if e.type == "DETECTION_EVENT":
+            day["eat_sessions"] += 1
+            day["eat_seconds"] += _seconds_from(d.get("content")) or 0
+        elif e.type == "DRINK":
+            day["drinks"] += 1
+            day["drink_ml"] += d.get("totalMl") or 0
+            day["drink_seconds"] += d.get("drinkTime") or 0
+        elif e.type == "GRAIN_OUTPUT_SUCCESS":
+            day["meals"] += 1
+            day["portions"] += d.get("actualGrainNum") or 0
+    return out
+
+
+def last_seen(db) -> dict:
+    """Most recent eating and drinking event per cat (UTC naive)."""
+    devs = {d.sn: d for d in db.query(PetlibroDevice).all()}
+    out: dict = {}
+    for e in db.query(PetlibroEvent).filter(PetlibroEvent.type.in_(["DETECTION_EVENT", "DRINK"]),
+                                            PetlibroEvent.timestamp >= utc_now() - timedelta(days=7)).all():
+        d = json.loads(e.data or "{}")
+        dev = devs.get(e.device_sn)
+        cat = d.get("petName") if d.get("petName") in CATS else (dev.cat if dev else None)
+        if not cat:
+            continue
+        key = "ate" if e.type == "DETECTION_EVENT" else "drank"
+        if e.timestamp > out.setdefault(cat, {}).get(key, datetime.min):
+            out[cat][key] = e.timestamp
+    return out
+
+
+def device_alerts(db) -> list[dict]:
+    out = []
+    for dev in db.query(PetlibroDevice).all():
+        real = _latest(db, dev.sn, "real_info") or {}
+        if dev.online == 0:
+            out.append({"key": f"pl_offline:{dev.sn}", "title": f"{dev.cat + chr(39) + 's ' if dev.cat else ''}{'feeder' if dev.kind == 'feeder' else 'fountain'} is offline"})
+        if dev.kind == "feeder" and real.get("surplusGrain") is False:
+            out.append({"key": f"pl_food_low:{dev.sn}", "title": f"{dev.cat or 'A'}{chr(39) + 's' if dev.cat else ''} feeder is running low on food"})
+        if dev.kind == "feeder" and real.get("grainOutletState") is False:
+            out.append({"key": f"pl_outlet:{dev.sn}", "title": f"{dev.cat or 'A'}{chr(39) + 's' if dev.cat else ''} feeder outlet looks blocked"})
+        if dev.kind == "fountain":
+            pct = _num(real, "weightPercent")
+            if pct is not None and pct < 20:
+                out.append({"key": "pl_water_low", "title": f"Fountain water is low ({pct:.0f}%)"})
+    return out
 
 def _latest(db, sn, kind):
     row = db.query(PetlibroDaily).filter(PetlibroDaily.device_sn == sn, PetlibroDaily.kind == kind) \
@@ -248,18 +332,18 @@ def summary(db) -> dict:
             meals = [{"time": p.get("executionTime"), "portions": p.get("grainNum"), "label": p.get("label")}
                      for p in plans if isinstance(p, dict) and p.get("enable")]
             meals.sort(key=lambda m: str(m["time"]))
-            history = []
-            for row in db.query(PetlibroDaily).filter(PetlibroDaily.device_sn == dev.sn,
-                                                      PetlibroDaily.kind == "grain_status") \
-                    .order_by(PetlibroDaily.day.desc()).limit(60).all():
-                g = json.loads(row.data) if row.data else {}
-                history.append({"day": row.day,
-                                "portions": _num(g, "todayFeedingQuantity"),
-                                "meals": _num(g, "todayFeedingTimes"),
-                                "eating_sessions": _num(g, "todayEatingTimes"),
-                                "eating_seconds": _num(g, "petEatingTime")})
-            history.reverse()
-            out["cats"][dev.cat] = {"meals": meals, "today": history[-1] if history else None, "history": history}
+            out["cats"].setdefault(dev.cat, {})["meals"] = meals
+
+    stats = daily_stats(db, days=60)
+    today = str(local_date(utc_now()))
+    for cat in CATS:
+        days = stats.get(cat, {})
+        history = [{"day": d, "eating_sessions": v["eat_sessions"], "eating_seconds": v["eat_seconds"],
+                    "drinks": v["drinks"], "drink_ml": v["drink_ml"], "meals": v["meals"], "portions": v["portions"]}
+                   for d, v in sorted(days.items())]
+        c = out["cats"].setdefault(cat, {"meals": []})
+        c["history"] = history
+        c["today"] = next((h for h in history if h["day"] == today), None)
     return out
 
 

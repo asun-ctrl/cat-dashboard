@@ -271,6 +271,7 @@ async def run_alerts():
     try:
         visits = load_assessed(db, days=60)
         found = alerting.evaluate(visits, latest_robot(db), last_success(db))
+        found += alerting.feeder_alerts(petlibro.last_seen(db), petlibro.device_alerts(db)) if petlibro.configured() else []
         logged = await alerting.process(db, found)
         if logged:
             print(f"[ALERTS] {logged}")
@@ -571,7 +572,8 @@ def get_insights():
     try:
         visits = load_assessed(db, days=120)
         obs = db.query(Observation).filter(Observation.created_at >= utc_now() - timedelta(days=60)).all()
-        return build_insights(visits, _profiles(db), _weight_history(db), obs, meal_times=petlibro.meal_times(db))
+        return build_insights(visits, _profiles(db), _weight_history(db), obs, meal_times=petlibro.meal_times(db),
+                              feeder_stats=petlibro.daily_stats(db, days=40))
     finally:
         db.close()
 

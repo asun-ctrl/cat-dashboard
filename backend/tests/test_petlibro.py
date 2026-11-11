@@ -33,9 +33,16 @@ def fake_api(calls):
         if path == "/device/device/realInfo":
             return ok({"online": True, "surplusGrain": True, "weightPercent": 62, "weight": 980})
         if path == "/device/workRecord/list":
-            if "type" not in body:
-                return httpx.Response(200, json={"code": 1001, "msg": "type required"})
-            return ok([{"workRecords": [{"type": "GRAIN_OUTPUT_SUCCESS", "recordTime": now_ms - 3600_000, "actualGrainNum": 2}]}])
+            if not (body["startTime"] <= now_ms - 3600_000 < body["endTime"]):
+                return ok([])
+            recs = {"AF1": [{"type": "GRAIN_OUTPUT_SUCCESS", "recordTime": now_ms - 3600_000, "actualGrainNum": 2},
+                            {"type": "DETECTION_EVENT", "recordTime": now_ms - 3500_000, "petName": "Lychee",
+                             "content": "Lychee came to eat and ate for 01m20s."},
+                            {"type": "DETECTION_EVENT", "recordTime": now_ms - 3400_000, "petName": "Lychee",
+                             "content": "Lychee came to eat and ate for 11s."}],
+                    "WF1": [{"type": "DRINK", "recordTime": now_ms - 3300_000, "petName": "Guava", "totalMl": 12, "drinkTime": 34},
+                            {"type": "DRINK", "recordTime": now_ms - 3200_000, "petName": "Lychee", "totalMl": 20, "drinkTime": 40}]}
+            return ok([{"workRecords": recs.get(body["deviceSn"], [])}])
         return ok({})
     return handler
 
@@ -50,10 +57,15 @@ def test_sync_and_summary(monkeypatch):
     assert "3 devices" in msg
     cats = {d.sn: d.cat for d in db.query(PetlibroDevice).all()}
     assert cats["AF1"] == "Lychee" and cats["AF2"] == "Guava" and cats["WF1"] is None
-    assert db.query(PetlibroEvent).count() >= 2
+    assert db.query(PetlibroEvent).count() == 5
     assert petlibro.meal_times(db) == {"Lychee": ["08:30", "20:30"], "Guava": ["08:30", "20:30"]}
     s = petlibro.summary(db)
-    assert s["cats"]["Guava"]["today"]["eating_sessions"] == 5
+    stats = petlibro.daily_stats(db)
+    lday = list(stats["Lychee"].values())[0]
+    assert lday["eat_sessions"] == 2 and lday["eat_seconds"] == 91 and lday["drink_ml"] == 20 and lday["portions"] == 2
+    assert list(stats["Guava"].values())[0]["drink_ml"] == 12
+    assert s["cats"]["Lychee"]["today"]["eating_seconds"] == 91
+    assert "Lychee" in petlibro.last_seen(db)
     assert [m["time"] for m in s["cats"]["Lychee"]["meals"]] == ["08:30", "20:30"]
     fountain = [d for d in s["devices"] if d["kind"] == "fountain"][0]
     assert fountain["water_percent"] == 62

@@ -85,3 +85,19 @@ def test_low_poop_with_normal_total_reads_as_mislabel():
     f = {x["id"]: x for x in c["findings"]}
     assert "very little poop" in f["stool"]["title"] and "pee" in f["stool"]["detail"]
     assert f["urine"]["level"] in ("info", "good"), f["urine"]["title"]
+
+def test_eating_drop_and_drinking_rise():
+    rows, _ = make_rows(now=NOW, days=40)
+    from timeutil import local_date
+    today = local_date(NOW)
+    fs = {"Lychee": {}}
+    for i in range(1, 31):
+        d = str(today - timedelta(days=i))
+        recent = i <= 7
+        fs["Lychee"][d] = {"eat_sessions": 12, "eat_seconds": (150 if recent else 420), "drinks": 6,
+                           "drink_ml": (190 if recent else 100), "drink_seconds": 200, "meals": 2, "portions": 4}
+    c = {x["cat"]: x for x in build_insights(assess(rows), {"Lychee": {"gender": "MALE"}}, {}, [], now=NOW, feeder_stats=fs)["cats"]}["Lychee"]
+    f = {x["id"]: x for x in c["findings"]}
+    assert f["eating"]["level"] == "concern" and "less" in f["eating"]["title"]
+    assert f["water"]["level"] == "watch" and "more" in f["water"]["title"]
+    assert "him" in f["eating"]["why"] and c["status"] == "concern"

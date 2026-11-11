@@ -229,3 +229,33 @@ export function EatingBlock({ cat, data }) {
     </Block>
   );
 }
+
+// ── Drinking (PetLibro RFID fountain) ──────────────────────────────────────
+export function WaterBlock({ cat, data, vital }) {
+  const hist = (data?.history || []).filter(h => h.drink_ml != null);
+  if (!hist.some(h => h.drink_ml > 0)) return null;
+  const full = hist.slice(0, -1).filter(h => h.drink_ml > 0);
+  const avg = full.length ? full.reduce((a, h) => a + h.drink_ml, 0) / full.length : null;
+  const today = data?.today;
+  let takeaway = `How much ${cat} drank from the fountain each day. The fountain reads ${cat}'s tag, so this is ${cat}'s water only.`;
+  if (vital?.value != null) {
+    takeaway += ` Last week averaged about ${vital.value} mL a day` + (vital.baseline ? ` (before that, ${vital.baseline} mL).` : '.');
+  }
+  if (today?.drink_ml != null) takeaway += ` Today so far: ${today.drink_ml} mL over ${today.drinks} drinks.`;
+  const chart = hist.map(h => ({ d: h.day, label: fmt.day(h.day), ml: h.drink_ml, n: h.drinks }));
+  return (
+    <Block title="Drinking" takeaway={takeaway}
+      legend={<div className="legend"><span><i style={{ background: '#4B8FD1' }} />mL from the fountain</span>{avg != null && <span><i className="line" style={{ background: C.axis }} />Typical day</span>}</div>}>
+      <ResponsiveContainer width="100%" height={160}>
+        <BarChart data={chart} margin={{ top: 8, right: 8, left: 0, bottom: 0 }} barCategoryGap="25%">
+          <CartesianGrid stroke={C.grid} vertical={false} />
+          {avg != null && <ReferenceLine y={avg} stroke={C.axis} strokeDasharray="4 3" />}
+          <XAxis dataKey="label" tick={axisTick} tickLine={false} axisLine={{ stroke: C.grid }} minTickGap={20} />
+          <YAxis tick={axisTick} tickLine={false} axisLine={false} width={40} />
+          <Tooltip cursor={{ fill: 'rgba(29,33,51,.05)' }} content={<Tip render={p => <><b>{fmt.weekday(p.d)}</b>{p.ml} mL over {p.n} drinks</>} />} />
+          <Bar dataKey="ml" fill="#4B8FD1" radius={[4, 4, 0, 0]} isAnimationActive={false} />
+        </BarChart>
+      </ResponsiveContainer>
+    </Block>
+  );
+}

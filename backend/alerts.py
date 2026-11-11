@@ -151,6 +151,22 @@ def evaluate(visits: list[Assessed], robot: Optional[dict], last_success: Option
     return alerts
 
 
+def feeder_alerts(last_seen: dict, device_issues: list, now: Optional[datetime] = None) -> list[Alert]:
+    now = now or utc_now()
+    out = []
+    for cat in CATS:
+        ate = (last_seen.get(cat) or {}).get("ate")
+        if ate and (now - ate).total_seconds() / 3600 >= int(os.getenv("NO_EATING_HOURS", "24")):
+            out.append(Alert(key=f"no_eating:{cat}", severity="critical", cat=cat, cooldown_hours=12,
+                             title=f"{cat} hasn't eaten in {int((now - ate).total_seconds() // 3600)}h",
+                             message=f"{cat}'s feeder hasn't seen {cat} since {fmt_local(ate)}. Check on {cat} and the feeder. "
+                                     "A cat that stops eating needs a vet soon."))
+    for issue in device_issues:
+        out.append(Alert(key=issue["key"], severity="warning", cooldown_hours=24, title=issue["title"],
+                         message="Reported by PetLibro."))
+    return out
+
+
 # ── Delivery ─────────────────────────────────────────────────────────────────
 
 def channels_configured() -> dict:
