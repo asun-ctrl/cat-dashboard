@@ -216,9 +216,19 @@ async def sync_litter_robot(historical: bool = False):
     await run_alerts()
 
 
+_petlibro_lock = asyncio.Lock()
+
+
 async def sync_petlibro():
     if not petlibro.configured():
         return
+    if _petlibro_lock.locked():
+        return          # a sync is already running
+    async with _petlibro_lock:
+        await _sync_petlibro()
+
+
+async def _sync_petlibro():
     db = SessionLocal()
     try:
         msg = await petlibro.sync(db)

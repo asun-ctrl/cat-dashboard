@@ -279,6 +279,15 @@ def debug_shapes(db) -> dict:
             v = _latest(db, dev.sn, kind)
             if v is not None:
                 kinds[kind] = shape(v)
-        types = sorted({e.type for e in db.query(PetlibroEvent).filter(PetlibroEvent.device_sn == dev.sn).all()})
-        out[f"{dev.product} ({dev.cat or 'unmatched'})"] = {"responses": kinds, "event_types": types}
+        events = db.query(PetlibroEvent).filter(PetlibroEvent.device_sn == dev.sn).order_by(PetlibroEvent.timestamp.desc()).all()
+        samples = {}
+        for e in events:
+            if e.type not in samples:
+                d = json.loads(e.data or "{}")
+                samples[e.type] = {k: (v if k in ("type", "petName", "petId", "petIds", "content", "title", "dataType")
+                                       or isinstance(v, (int, float, bool)) and k not in ("recordTime",) else type(v).__name__)
+                                   for k, v in d.items()}
+        out[f"{dev.product} ({dev.cat or 'unmatched'})"] = {"responses": kinds, "event_types": sorted(samples),
+                                                              "event_samples": samples,
+                                                              "event_counts": {t: sum(1 for e in events if e.type == t) for t in samples}}
     return out
